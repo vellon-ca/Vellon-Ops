@@ -1,7 +1,13 @@
 "use server";
 
+import { headers } from "next/headers";
 import { requirePlatformOwner } from "@/lib/auth/guard";
-import { mgcjSupabase } from "@/lib/connectors/mgcj";
+import {
+  mgcjSupabase,
+  stripePost,
+  stripeGet,
+  stripeConfigured,
+} from "@/lib/connectors/mgcj";
 import { writeAudit } from "@/lib/audit";
 
 export type ActionResult<T> =
@@ -180,4 +186,131 @@ export async function addInvites(input: {
   });
 
   return { ok: true, data: { invites } };
+}
+
+// ── Step 4: Stripe Connect ──────────────────────────────────────────
+export type StripeStatus = {
+  accountId: string;
+  onboardingUrl: string | null;
+  chargesEnabled: boolean;
+  payoutsEnabled: boolean;
+  detailsSubmitted: boolean;
+};
+
+// Create the Express account + an onboarding link. Stamps stripe_account_id on
+// the company immediately (stripe_onboarded stays false, so no funds route yet).
+export async function startStripeOnboarding(input: {
+  companyId: string;
+}): Promise<ActionResult<StripeStatus>> {
+  const owner = await requirePlatformOwner();
+  if (!stripeConfigured())
+    return { ok: false, error: "Stripe secret key not configured." };
+
+  const mgcj = mgcjSupabase();
+  const { data: company } = await mgcj
+    .from("companies")
+    .select("name, stripe_account_id")
+    .eq("id", input.companyId)
+    .maybeSingle();
+  if (!company) return { ok: false, error: "Company not found." };
+
+  // Reuse an existing account if the step is being re-run.
+  let accountId = company.stripe_account_id as string | null;
+  if (!accountId) {
+    const acct = await stripePost("/accounts", {
+      type: "express",
+      country: "CA",
+      "capabilities[card_payments][requested]": "true",
+      "capabilities[transfers][requested]": "true",
+      "business_profile[name]": company.name,
+      "metadata[company_id]": input.companyId,
+    });
+    if (acct.error)
+      return { ok: false, error: acct.error.message ?? "Stripe account create failed." };
+    accountId = acct.id;
+
+    await mgcj
+      .from("companies")
+      .update({ stripe_account_id: accountId, stripe_onboarded: false })
+      .eq("id", input.companyId);
+
+    await writeAudit({
+      actorUserId: owner.id,
+      projectSlug: "mgcj",
+      action: "stripe.account_create",
+      target: input.companyId,
+      after: { stripe_account_id: accountId },
+    });
+  }
+
+  const origin =
+    (await headers()).get("origin") ??
+    process.env.NEXT_PUBLIC_APP_URL ??
+    "http://localhost:3000";
+  const link = await stripePost("/account_links", {
+    account: accountId!,
+    refresh_url: `${origin}/onboarding`,
+    return_url: `${origin}/onboarding`,
+    type: "account_onboarding",
+  });
+  if (link.error)
+    return { ok: false, error: link.error.message ?? "Stripe link create failed." };
+
+  return {
+    ok: true,
+    data: {
+      accountId: accountId!,
+      onboardingUrl: link.url,
+      chargesEnabled: false,
+      payoutsEnabled: false,
+      detailsSubmitted: false,
+    },
+  };
+}
+
+// Poll Stripe for the account's readiness; flip stripe_onboarded once charges
+// are enabled (the gate all three payment functions key off).
+export async function refreshStripeStatus(input: {
+  companyId: string;
+}): Promise<ActionResult<StripeStatus>> {
+  const owner = await requirePlatformOwner();
+
+  const mgcj = mgcjSupabase();
+  const { data: company } = await mgcj
+    .from("companies")
+    .select("stripe_account_id, stripe_onboarded")
+    .eq("id", input.companyId)
+    .maybeSingle();
+  if (!company?.stripe_account_id)
+    return { ok: false, error: "No Stripe account for this company yet." };
+
+  const acct = await stripeGet(`/accounts/${company.stripe_account_id}`);
+  if (acct.error)
+    return { ok: false, error: acct.error.message ?? "Could not load Stripe account." };
+
+  const chargesEnabled = !!acct.charges_enabled;
+  if (chargesEnabled && !company.stripe_onboarded) {
+    await mgcj
+      .from("companies")
+      .update({ stripe_onboarded: true })
+      .eq("id", input.companyId);
+    await writeAudit({
+      actorUserId: owner.id,
+      projectSlug: "mgcj",
+      action: "stripe.onboarded",
+      target: input.companyId,
+      after: { stripe_onboarded: true },
+    });
+  }
+
+  return {
+    ok: true,
+    data: {
+      accountId: company.stripe_account_id,
+      onboardingUrl: null,
+      chargesEnabled,
+      payoutsEnabled: !!acct.payouts_enabled,
+      detailsSubmitted: !!acct.details_submitted,
+    },
+  };
 }

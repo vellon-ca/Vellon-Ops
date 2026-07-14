@@ -5,10 +5,13 @@ import {
   createCompany,
   createDispatcher,
   addInvites,
+  startStripeOnboarding,
+  refreshStripeStatus,
   type InviteResult,
+  type StripeStatus,
 } from "@/app/(app)/onboarding/actions";
 
-const STEPS = ["Company", "Dispatcher", "Invites", "Done"] as const;
+const STEPS = ["Company", "Dispatcher", "Invites", "Stripe", "Done"] as const;
 
 const input =
   "w-full rounded-md border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-zinc-100 outline-none focus:border-accent";
@@ -25,6 +28,7 @@ export function OnboardingWizard() {
   const [dispatcherId, setDispatcherId] = useState<string | null>(null);
   const [invites, setInvites] = useState<InviteResult[]>([]);
   const [driverRows, setDriverRows] = useState([{ name: "", phone: "" }]);
+  const [stripe, setStripe] = useState<StripeStatus | null>(null);
 
   function run<T>(fn: () => Promise<T>) {
     setError(null);
@@ -37,8 +41,9 @@ export function OnboardingWizard() {
     <div>
       <h1 className="text-xl font-semibold text-zinc-100">Onboard a company</h1>
       <p className="mt-1 text-sm text-zinc-500">
-        Creates the company, its first dispatcher, and driver invite codes in
-        the mgcj backend. Stripe onboarding is a separate step (coming next).
+        Creates the company, its first dispatcher, driver invite codes, and
+        Stripe payout onboarding in the mgcj backend. Steps can be skipped and
+        revisited.
       </p>
 
       {/* stepper */}
@@ -258,17 +263,106 @@ export function OnboardingWizard() {
             >
               + Add another driver
             </button>
-            <button
-              type="submit"
-              disabled={pending}
-              className="w-full rounded-md bg-accent px-3 py-2 text-sm font-medium text-white hover:bg-accent-hover disabled:opacity-50"
-            >
-              {pending ? "Generating…" : "Generate invite codes"}
-            </button>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setInvites([]);
+                  setStep(3);
+                }}
+                className="rounded-md border border-zinc-700 px-3 py-2 text-sm text-zinc-400 hover:bg-zinc-800/50"
+              >
+                Skip for now
+              </button>
+              <button
+                type="submit"
+                disabled={pending}
+                className="flex-1 rounded-md bg-accent px-3 py-2 text-sm font-medium text-white hover:bg-accent-hover disabled:opacity-50"
+              >
+                {pending ? "Generating…" : "Generate invite codes"}
+              </button>
+            </div>
           </form>
         )}
 
         {step === 3 && (
+          <div className="space-y-4">
+            <p className="text-sm text-zinc-500">
+              Set up Stripe payouts for {companyName}. This creates a Connect
+              account and gives you an onboarding link to send them. The company
+              only goes payment-ready once Stripe confirms it.
+            </p>
+
+            {!stripe && (
+              <button
+                type="button"
+                disabled={pending}
+                onClick={() =>
+                  run(async () => {
+                    const res = await startStripeOnboarding({
+                      companyId: companyId!,
+                    });
+                    if (!res.ok) return setError(res.error);
+                    setStripe(res.data);
+                  })
+                }
+                className="w-full rounded-md bg-accent px-3 py-2 text-sm font-medium text-white hover:bg-accent-hover disabled:opacity-50"
+              >
+                {pending ? "Creating…" : "Create Stripe account"}
+              </button>
+            )}
+
+            {stripe && (
+              <div className="space-y-3">
+                {stripe.chargesEnabled ? (
+                  <div className="rounded-md border border-emerald-900/40 bg-emerald-950/30 px-3 py-2 text-sm text-emerald-300">
+                    ✅ Stripe onboarded — this company is payment-ready.
+                  </div>
+                ) : (
+                  <>
+                    <div className="space-y-1.5">
+                      <label className={label}>Onboarding link (send to company)</label>
+                      <input
+                        readOnly
+                        value={stripe.onboardingUrl ?? ""}
+                        onFocus={(e) => e.currentTarget.select()}
+                        className={input + " text-xs"}
+                      />
+                    </div>
+                    <button
+                      type="button"
+                      disabled={pending}
+                      onClick={() =>
+                        run(async () => {
+                          const res = await refreshStripeStatus({
+                            companyId: companyId!,
+                          });
+                          if (!res.ok) return setError(res.error);
+                          setStripe(res.data);
+                        })
+                      }
+                      className="w-full rounded-md border border-zinc-700 px-3 py-2 text-sm text-zinc-300 hover:bg-zinc-800/50 disabled:opacity-50"
+                    >
+                      {pending ? "Checking…" : "Check status"}
+                    </button>
+                  </>
+                )}
+              </div>
+            )}
+
+            <div className="flex gap-2 pt-2">
+              <button
+                type="button"
+                onClick={() => setStep(4)}
+                className="w-full rounded-md border border-zinc-700 px-3 py-2 text-sm text-zinc-300 hover:bg-zinc-800/50"
+              >
+                {stripe?.chargesEnabled ? "Finish" : "Skip / finish later"}
+              </button>
+            </div>
+          </div>
+        )}
+
+        {step === 4 && (
           <div className="space-y-4">
             <div>
               <p className="text-sm font-medium text-zinc-200">
@@ -298,10 +392,16 @@ export function OnboardingWizard() {
                 ))}
               </div>
             </div>
-            <div className="rounded-md border border-amber-900/40 bg-amber-950/30 px-3 py-2 text-xs text-amber-300/90">
-              Stripe not set up yet — this company can't take card payouts until
-              Stripe onboarding is completed (coming next).
-            </div>
+            {stripe?.chargesEnabled ? (
+              <div className="rounded-md border border-emerald-900/40 bg-emerald-950/30 px-3 py-2 text-xs text-emerald-300">
+                Stripe onboarded — card payouts route to this company.
+              </div>
+            ) : (
+              <div className="rounded-md border border-amber-900/40 bg-amber-950/30 px-3 py-2 text-xs text-amber-300/90">
+                Stripe not finished — card fares won&apos;t route to this company
+                until its Stripe onboarding is completed. You can revisit later.
+              </div>
+            )}
             <button
               onClick={() => {
                 setStep(0);
@@ -310,6 +410,7 @@ export function OnboardingWizard() {
                 setDispatcherId(null);
                 setInvites([]);
                 setDriverRows([{ name: "", phone: "" }]);
+                setStripe(null);
               }}
               className="w-full rounded-md border border-zinc-700 px-3 py-2 text-sm text-zinc-300 hover:bg-zinc-800/50"
             >

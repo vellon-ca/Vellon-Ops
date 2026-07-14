@@ -44,6 +44,16 @@ export async function stripePost(
   return res.json();
 }
 
+export async function stripeGet(path: string) {
+  const key = process.env.MGCJ_STRIPE_SECRET;
+  if (!key?.startsWith("sk_"))
+    throw new Error("Stripe not configured with a secret (sk_) key.");
+  const res = await fetch(`https://api.stripe.com/v1${path}`, {
+    headers: { Authorization: `Bearer ${key}` },
+  });
+  return res.json();
+}
+
 export function stripeConfigured() {
   return (process.env.MGCJ_STRIPE_SECRET ?? "").startsWith("sk_");
 }
