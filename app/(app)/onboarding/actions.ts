@@ -12,7 +12,7 @@ import { writeAudit } from "@/lib/audit";
 
 export type ActionResult<T> =
   | { ok: true; data: T }
-  | { ok: false; error: string };
+  | { ok: false; error: string; duplicate?: boolean };
 
 // ── Step 1: create company ──────────────────────────────────────────
 export async function createCompany(input: {
@@ -23,6 +23,9 @@ export async function createCompany(input: {
   hstNumber?: string;
   studentDiscountEnabled: boolean;
   studentDiscountPct?: number;
+  // Set true to bypass the same-name guard (a genuinely distinct company that
+  // happens to share a name with an existing one).
+  force?: boolean;
 }): Promise<ActionResult<{ companyId: string; name: string }>> {
   const owner = await requirePlatformOwner();
 
@@ -34,6 +37,25 @@ export async function createCompany(input: {
     return { ok: false, error: "Fare values can't be negative." };
 
   const mgcj = mgcjSupabase();
+
+  // Soft duplicate-name guard. The companies list is the real defence against
+  // accidental re-onboarding (resume instead of restart); this just catches a
+  // fresh run against a name that already exists so it isn't done blindly.
+  if (!input.force) {
+    const { data: existing } = await mgcj
+      .from("companies")
+      .select("id, name")
+      .ilike("name", name)
+      .limit(1)
+      .maybeSingle();
+    if (existing)
+      return {
+        ok: false,
+        duplicate: true,
+        error: `A company named "${existing.name}" already exists. Resume it from the list below, or choose "Create anyway" if this is a separate company.`,
+      };
+  }
+
   const { data, error } = await mgcj
     .from("companies")
     .insert({
@@ -81,6 +103,18 @@ export async function createDispatcher(input: {
     return { ok: false, error: "Phone must be E.164 format, e.g. +19025551234." };
 
   const mgcj = mgcjSupabase();
+
+  // Idempotent: if this company already has an admin (e.g. a resumed run, or a
+  // step recomputed wrong), return that one instead of trying to create a
+  // second auth user — auth.admin.createUser hard-errors on a duplicate phone.
+  const { data: existingAdmin } = await mgcj
+    .from("profiles")
+    .select("id, name")
+    .eq("company_id", input.companyId)
+    .eq("role", "admin")
+    .limit(1)
+    .maybeSingle();
+  if (existingAdmin) return { ok: true, data: { userId: existingAdmin.id } };
 
   const { data: created, error: cErr } = await mgcj.auth.admin.createUser({
     phone,
@@ -197,6 +231,24 @@ export type StripeStatus = {
   detailsSubmitted: boolean;
 };
 
+// Mint a fresh Stripe hosted-onboarding link. Account links are single-use and
+// expire quickly, so we always generate a new one at the moment it's needed
+// rather than storing/reusing a stale URL.
+async function mintAccountLink(accountId: string): Promise<string | null> {
+  const origin =
+    (await headers()).get("origin") ??
+    process.env.NEXT_PUBLIC_APP_URL ??
+    "http://localhost:3000";
+  const link = await stripePost("/account_links", {
+    account: accountId,
+    refresh_url: `${origin}/onboarding`,
+    return_url: `${origin}/onboarding`,
+    type: "account_onboarding",
+  });
+  if (link.error) return null;
+  return link.url ?? null;
+}
+
 // Create the Express account + an onboarding link. Stamps stripe_account_id on
 // the company immediately (stripe_onboarded stays false, so no funds route yet).
 export async function startStripeOnboarding(input: {
@@ -243,24 +295,15 @@ export async function startStripeOnboarding(input: {
     });
   }
 
-  const origin =
-    (await headers()).get("origin") ??
-    process.env.NEXT_PUBLIC_APP_URL ??
-    "http://localhost:3000";
-  const link = await stripePost("/account_links", {
-    account: accountId!,
-    refresh_url: `${origin}/onboarding`,
-    return_url: `${origin}/onboarding`,
-    type: "account_onboarding",
-  });
-  if (link.error)
-    return { ok: false, error: link.error.message ?? "Stripe link create failed." };
+  const onboardingUrl = await mintAccountLink(accountId!);
+  if (!onboardingUrl)
+    return { ok: false, error: "Stripe link create failed." };
 
   return {
     ok: true,
     data: {
       accountId: accountId!,
-      onboardingUrl: link.url,
+      onboardingUrl,
       chargesEnabled: false,
       payoutsEnabled: false,
       detailsSubmitted: false,
@@ -269,7 +312,9 @@ export async function startStripeOnboarding(input: {
 }
 
 // Poll Stripe for the account's readiness; flip stripe_onboarded once charges
-// are enabled (the gate all three payment functions key off).
+// are enabled (the gate all three payment functions key off). If it isn't ready
+// yet, mint a *fresh* onboarding link so the caller (Check status, or a resumed
+// run) always has a live link to hand the company — never a blanked-out field.
 export async function refreshStripeStatus(input: {
   companyId: string;
 }): Promise<ActionResult<StripeStatus>> {
@@ -307,10 +352,78 @@ export async function refreshStripeStatus(input: {
     ok: true,
     data: {
       accountId: company.stripe_account_id,
-      onboardingUrl: null,
+      onboardingUrl: chargesEnabled
+        ? null
+        : await mintAccountLink(company.stripe_account_id),
       chargesEnabled,
       payoutsEnabled: !!acct.payouts_enabled,
       detailsSubmitted: !!acct.details_submitted,
     },
   };
+}
+
+// ── Companies list (completed + in-progress onboarding) ─────────────
+// Onboarding progress is *derived* from mgcj's own tables — the source of
+// truth — rather than tracked in a separate table that could drift. Each
+// company's state falls out of what actually exists:
+//   • company row              → step 0 done (always, if it's in this list)
+//   • an admin profile         → dispatcher created
+//   • driver_invites rows      → invites minted (optional step)
+//   • stripe_account_id        → Stripe onboarding started
+//   • stripe_onboarded = true  → card-ready
+export type CompanyRow = {
+  id: string;
+  name: string;
+  dispatcherName: string | null;
+  inviteCount: number;
+  stripeAccountId: string | null;
+  stripeOnboarded: boolean;
+};
+
+export async function listCompanies(): Promise<ActionResult<CompanyRow[]>> {
+  await requirePlatformOwner();
+  const mgcj = mgcjSupabase();
+
+  const { data: companies, error } = await mgcj
+    .from("companies")
+    .select("id, name, stripe_account_id, stripe_onboarded")
+    .order("name", { ascending: true });
+  if (error) return { ok: false, error: error.message };
+  if (!companies || companies.length === 0) return { ok: true, data: [] };
+
+  const ids = companies.map((c) => c.id);
+
+  // First admin per company (their name), and invite counts. Both are small at
+  // this scale, so fetch the rows and fold in JS rather than N round-trips.
+  const [{ data: admins }, { data: invites }] = await Promise.all([
+    mgcj
+      .from("profiles")
+      .select("company_id, name")
+      .eq("role", "admin")
+      .in("company_id", ids),
+    mgcj.from("driver_invites").select("company_id").in("company_id", ids),
+  ]);
+
+  const dispatcherByCompany = new Map<string, string | null>();
+  for (const a of admins ?? [])
+    if (!dispatcherByCompany.has(a.company_id))
+      dispatcherByCompany.set(a.company_id, a.name ?? null);
+
+  const inviteCountByCompany = new Map<string, number>();
+  for (const inv of invites ?? [])
+    inviteCountByCompany.set(
+      inv.company_id,
+      (inviteCountByCompany.get(inv.company_id) ?? 0) + 1,
+    );
+
+  const rows: CompanyRow[] = companies.map((c) => ({
+    id: c.id,
+    name: c.name,
+    dispatcherName: dispatcherByCompany.get(c.id) ?? null,
+    inviteCount: inviteCountByCompany.get(c.id) ?? 0,
+    stripeAccountId: (c.stripe_account_id as string | null) ?? null,
+    stripeOnboarded: !!c.stripe_onboarded,
+  }));
+
+  return { ok: true, data: rows };
 }

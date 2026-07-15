@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useTransition } from "react";
+import { useEffect, useRef, useState, useTransition } from "react";
 import {
   createCompany,
   createDispatcher,
@@ -9,6 +9,7 @@ import {
   refreshStripeStatus,
   type InviteResult,
   type StripeStatus,
+  type CompanyRow,
 } from "@/app/(app)/onboarding/actions";
 
 const STEPS = ["Company", "Dispatcher", "Invites", "Stripe", "Done"] as const;
@@ -17,7 +18,30 @@ const input =
   "w-full rounded-md border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-zinc-100 outline-none focus:border-accent";
 const label = "block text-sm font-medium text-zinc-400";
 
-export function OnboardingWizard() {
+type CompanyInput = {
+  name: string;
+  platformFeePercent: number;
+  baseFare: number;
+  ratePerKm: number;
+  hstNumber: string;
+};
+
+// The first step of a resumed company that still has real work left. company +
+// dispatcher are the required steps; invites and Stripe are optional/skippable,
+// so we never bounce a resumed run back to step 0 or 1 once they're done.
+function resumeStep(r: CompanyRow): number {
+  if (!r.dispatcherName) return 1; // Dispatcher
+  if (r.stripeOnboarded || r.stripeAccountId) return 3; // Stripe (ready or in-progress)
+  return 2; // dispatcher done, Stripe not started → offer invites next
+}
+
+export function OnboardingWizard({
+  resume,
+  onChanged,
+}: {
+  resume?: CompanyRow | null;
+  onChanged?: () => void;
+}) {
   const [step, setStep] = useState(0);
   const [pending, startTransition] = useTransition();
   const [error, setError] = useState<string | null>(null);
@@ -29,11 +53,77 @@ export function OnboardingWizard() {
   const [invites, setInvites] = useState<InviteResult[]>([]);
   const [driverRows, setDriverRows] = useState([{ name: "", phone: "" }]);
   const [stripe, setStripe] = useState<StripeStatus | null>(null);
+  // Set on every successful status poll so a check that doesn't change the
+  // outcome still gives the user visible feedback that it ran.
+  const [stripeCheckedAt, setStripeCheckedAt] = useState<string | null>(null);
+
+  // Same-name guard: hold the last attempted company so "Create anyway" can
+  // re-submit it with force=true.
+  const [dupInput, setDupInput] = useState<CompanyInput | null>(null);
 
   function run<T>(fn: () => Promise<T>) {
     setError(null);
     startTransition(async () => {
       await fn();
+    });
+  }
+
+  function resetWizard() {
+    setStep(0);
+    setCompanyId(null);
+    setCompanyName("");
+    setDispatcherId(null);
+    setInvites([]);
+    setDriverRows([{ name: "", phone: "" }]);
+    setStripe(null);
+    setStripeCheckedAt(null);
+    setDupInput(null);
+    setError(null);
+  }
+
+  // Seed the wizard when the parent hands us a company to resume. The parent
+  // passes a fresh object per Resume click, so identity change = re-seed.
+  const prevResume = useRef<CompanyRow | null>(null);
+  useEffect(() => {
+    if (!resume || resume === prevResume.current) return;
+    prevResume.current = resume;
+    resetWizard();
+    setCompanyId(resume.id);
+    setCompanyName(resume.name);
+    setStep(resumeStep(resume));
+    // Pull live Stripe state (and a fresh link) if an account already exists.
+    if (resume.stripeAccountId) {
+      startTransition(async () => {
+        const res = await refreshStripeStatus({ companyId: resume.id });
+        if (res.ok) {
+          setStripe(res.data);
+          setStripeCheckedAt(new Date().toLocaleTimeString());
+        }
+      });
+    }
+  }, [resume]);
+
+  function submitCompany(data: CompanyInput, force: boolean) {
+    run(async () => {
+      const res = await createCompany({
+        name: data.name,
+        platformFeePercent: data.platformFeePercent,
+        baseFare: data.baseFare,
+        ratePerKm: data.ratePerKm,
+        hstNumber: data.hstNumber,
+        studentDiscountEnabled: false,
+        force,
+      });
+      if (!res.ok) {
+        setError(res.error);
+        if (res.duplicate) setDupInput(data);
+        return;
+      }
+      setDupInput(null);
+      setCompanyId(res.data.companyId);
+      setCompanyName(res.data.name);
+      setStep(1);
+      onChanged?.();
     });
   }
 
@@ -66,9 +156,19 @@ export function OnboardingWizard() {
       </ol>
 
       {error && (
-        <p className="mt-4 rounded-md border border-red-900/50 bg-red-950/40 px-3 py-2 text-sm text-red-300">
-          {error}
-        </p>
+        <div className="mt-4 rounded-md border border-red-900/50 bg-red-950/40 px-3 py-2 text-sm text-red-300">
+          <p>{error}</p>
+          {dupInput && step === 0 && (
+            <button
+              type="button"
+              disabled={pending}
+              onClick={() => submitCompany(dupInput, true)}
+              className="mt-2 rounded-md border border-red-800/60 px-3 py-1 text-xs text-red-200 hover:bg-red-900/30 disabled:opacity-50"
+            >
+              Create anyway
+            </button>
+          )}
+        </div>
       )}
 
       <div className="mt-6 max-w-lg rounded-xl border border-zinc-800 bg-zinc-900/40 p-6">
@@ -78,20 +178,16 @@ export function OnboardingWizard() {
             onSubmit={(e) => {
               e.preventDefault();
               const f = new FormData(e.currentTarget);
-              run(async () => {
-                const res = await createCompany({
+              submitCompany(
+                {
                   name: String(f.get("name")),
                   platformFeePercent: Number(f.get("fee")),
                   baseFare: Number(f.get("base")),
                   ratePerKm: Number(f.get("rate")),
                   hstNumber: String(f.get("hst") || ""),
-                  studentDiscountEnabled: false,
-                });
-                if (!res.ok) return setError(res.error);
-                setCompanyId(res.data.companyId);
-                setCompanyName(res.data.name);
-                setStep(1);
-              });
+                },
+                false,
+              );
             }}
           >
             <div className="space-y-1.5">
@@ -162,6 +258,7 @@ export function OnboardingWizard() {
                 if (!res.ok) return setError(res.error);
                 setDispatcherId(res.data.userId);
                 setStep(2);
+                onChanged?.();
               });
             }}
           >
@@ -206,6 +303,7 @@ export function OnboardingWizard() {
                 if (!res.ok) return setError(res.error);
                 setInvites(res.data.invites);
                 setStep(3);
+                onChanged?.();
               });
             }}
           >
@@ -304,6 +402,7 @@ export function OnboardingWizard() {
                     });
                     if (!res.ok) return setError(res.error);
                     setStripe(res.data);
+                    onChanged?.();
                   })
                 }
                 className="w-full rounded-md bg-accent px-3 py-2 text-sm font-medium text-white hover:bg-accent-hover disabled:opacity-50"
@@ -339,12 +438,30 @@ export function OnboardingWizard() {
                           });
                           if (!res.ok) return setError(res.error);
                           setStripe(res.data);
+                          setStripeCheckedAt(new Date().toLocaleTimeString());
+                          onChanged?.();
                         })
                       }
                       className="w-full rounded-md border border-zinc-700 px-3 py-2 text-sm text-zinc-300 hover:bg-zinc-800/50 disabled:opacity-50"
                     >
                       {pending ? "Checking…" : "Check status"}
                     </button>
+                    {!stripe.onboardingUrl && (
+                      <p className="text-xs text-amber-300/80">
+                        Couldn&apos;t generate a fresh onboarding link — click
+                        Check status to try again.
+                      </p>
+                    )}
+                    {stripeCheckedAt && (
+                      <p className="text-xs text-zinc-500">
+                        {stripe.detailsSubmitted
+                          ? "Details submitted — Stripe is still reviewing. This can take a few minutes."
+                          : "Not completed yet — the company still needs to finish the Stripe form via the link above."}{" "}
+                        <span className="text-zinc-600">
+                          (checked {stripeCheckedAt})
+                        </span>
+                      </p>
+                    )}
                   </>
                 )}
               </div>
@@ -373,25 +490,27 @@ export function OnboardingWizard() {
                 {invites.length === 1 ? "" : "s"} generated
               </p>
             </div>
-            <div>
-              <p className={label}>Driver invite codes</p>
-              <div className="mt-2 space-y-2">
-                {invites.map((inv) => (
-                  <div
-                    key={inv.code}
-                    className="flex items-center justify-between rounded-md border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm"
-                  >
-                    <span className="text-zinc-400">
-                      {inv.name || inv.phone}
-                      {inv.name && (
-                        <span className="ml-2 text-zinc-600">{inv.phone}</span>
-                      )}
-                    </span>
-                    <code className="font-mono text-zinc-100">{inv.code}</code>
-                  </div>
-                ))}
+            {invites.length > 0 && (
+              <div>
+                <p className={label}>Driver invite codes</p>
+                <div className="mt-2 space-y-2">
+                  {invites.map((inv) => (
+                    <div
+                      key={inv.code}
+                      className="flex items-center justify-between rounded-md border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm"
+                    >
+                      <span className="text-zinc-400">
+                        {inv.name || inv.phone}
+                        {inv.name && (
+                          <span className="ml-2 text-zinc-600">{inv.phone}</span>
+                        )}
+                      </span>
+                      <code className="font-mono text-zinc-100">{inv.code}</code>
+                    </div>
+                  ))}
+                </div>
               </div>
-            </div>
+            )}
             {stripe?.chargesEnabled ? (
               <div className="rounded-md border border-emerald-900/40 bg-emerald-950/30 px-3 py-2 text-xs text-emerald-300">
                 Stripe onboarded — card payouts route to this company.
@@ -403,15 +522,7 @@ export function OnboardingWizard() {
               </div>
             )}
             <button
-              onClick={() => {
-                setStep(0);
-                setCompanyId(null);
-                setCompanyName("");
-                setDispatcherId(null);
-                setInvites([]);
-                setDriverRows([{ name: "", phone: "" }]);
-                setStripe(null);
-              }}
+              onClick={resetWizard}
               className="w-full rounded-md border border-zinc-700 px-3 py-2 text-sm text-zinc-300 hover:bg-zinc-800/50"
             >
               Onboard another
