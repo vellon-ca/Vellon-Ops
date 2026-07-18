@@ -6,8 +6,9 @@ import { supabaseAdmin } from "@/lib/supabase/admin";
 import { writeAudit } from "@/lib/audit";
 import { getPlatformSettings } from "@/app/(app)/configuration/actions";
 import { buildInvoicePdf } from "@/lib/pdf/invoice";
+import { buildInvoiceEmailHtml } from "@/lib/email/invoiceEmail";
 
-const RESEND_FROM_ADDRESS = "billing@vellon.ca";
+const RESEND_FROM_ADDRESS = "Vellon <billing@vellon.ca>";
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
 
@@ -345,7 +346,11 @@ type BuiltInvoicePdf = {
   invoiceNumber: string;
   companyName: string;
   periodLabel: string;
+  cashFaresTotal: number;
+  feePercent: number;
+  rideCount: number;
   amountDue: number;
+  paymentInstructions: string | null;
   billingEmail: string | null;
 };
 
@@ -427,7 +432,11 @@ async function buildAndStoreInvoicePdf(
       invoiceNumber,
       companyName: invoice.company_name,
       periodLabel,
+      cashFaresTotal: Number(invoice.cash_fares_total),
+      feePercent: Number(invoice.fee_percent),
+      rideCount: invoice.ride_count,
       amountDue: Number(invoice.amount_due),
+      paymentInstructions: settingsRes.data.paymentInstructions,
       billingEmail: company?.billing_email ?? null,
     },
   };
@@ -454,8 +463,19 @@ export async function sendInvoice(input: {
 
   const built = await buildAndStoreInvoicePdf(input.id);
   if (!built.ok) return built;
-  const { pdfBytes, pdfPath, invoiceNumber, companyName, periodLabel, amountDue, billingEmail } =
-    built.data;
+  const {
+    pdfBytes,
+    pdfPath,
+    invoiceNumber,
+    companyName,
+    periodLabel,
+    cashFaresTotal,
+    feePercent,
+    rideCount,
+    amountDue,
+    paymentInstructions,
+    billingEmail,
+  } = built.data;
 
   if (!billingEmail) {
     return {
@@ -475,8 +495,17 @@ export async function sendInvoice(input: {
     body: JSON.stringify({
       from: RESEND_FROM_ADDRESS,
       to: billingEmail,
-      subject: `${invoiceNumber} — ${companyName} platform fee invoice (${periodLabel})`,
-      html: `<p>Attached is your platform fee invoice for ${periodLabel} — $${amountDue.toFixed(2)} due.</p>`,
+      subject: `Your Vellon platform fee invoice for ${periodLabel} — $${amountDue.toFixed(2)} due`,
+      html: buildInvoiceEmailHtml({
+        companyName,
+        invoiceNumber,
+        periodLabel,
+        amountDue,
+        cashFaresTotal,
+        feePercent,
+        rideCount,
+        paymentInstructions,
+      }),
       attachments: [
         { filename: `${invoiceNumber}.pdf`, content: base64Pdf, content_type: "application/pdf" },
       ],
