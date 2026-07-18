@@ -21,7 +21,7 @@ function missingMigrationMsg(err: {
       err.message,
     );
   return missing
-    ? "Revenue needs two migrations applied: 20260714_ops_revenue.sql in the mgcj SQL editor (then NOTIFY pgrst, 'reload schema') and 0002_invoices.sql in the vellon-ops hub SQL editor."
+    ? "Revenue needs three migrations applied, in order: 20260718_ride_completed_at.sql then 20260714_ops_revenue.sql in the mgcj SQL editor (then NOTIFY pgrst, 'reload schema'), and 0002_invoices.sql in the vellon-ops hub SQL editor."
     : null;
 }
 
