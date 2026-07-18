@@ -7,7 +7,7 @@ import {
   listInvoices,
   updateInvoiceStatus,
   sendInvoice,
-  getInvoicePdfUrl,
+  previewInvoicePdf,
   type RevenueSummary,
   type Invoice,
 } from "@/app/(app)/revenue/actions";
@@ -441,11 +441,17 @@ function InvoiceSection() {
     });
   };
 
-  const downloadPdf = (pdfPath: string) => {
+  // Generates (or regenerates) the PDF and opens it — works before sending
+  // (preview what will go out) and regardless of whether the company has a
+  // billing email on file (manual-delivery fallback).
+  const [previewingId, setPreviewingId] = useState<string | null>(null);
+  const preview = (id: string) => {
+    setPreviewingId(id);
     startTransition(async () => {
-      const res = await getInvoicePdfUrl({ pdfPath });
+      const res = await previewInvoicePdf({ id });
       if (res.ok) window.open(res.url, "_blank");
       else setError(res.error);
+      setPreviewingId(null);
     });
   };
 
@@ -535,11 +541,9 @@ function InvoiceSection() {
                 </td>
                 <td className="px-4 py-2.5 text-right">
                   <div className="flex justify-end gap-1.5">
-                    {inv.pdf_path && (
-                      <ActBtn onClick={() => downloadPdf(inv.pdf_path!)} muted>
-                        Download PDF
-                      </ActBtn>
-                    )}
+                    <ActBtn onClick={() => preview(inv.id)} muted>
+                      {previewingId === inv.id ? "…" : "Preview / Download PDF"}
+                    </ActBtn>
                     {inv.status === "draft" && (
                       <ActBtn onClick={() => send(inv.id)}>Send invoice</ActBtn>
                     )}

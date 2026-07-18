@@ -339,21 +339,31 @@ export async function updateInvoiceStatus(input: {
   return { ok: true };
 }
 
-// Generate the PDF (if needed) and email it to the company's billing contact,
-// then flip the invoice to sent. Regenerates the PDF fresh every call — drafts
-// can still change up until sent/paid locks them, so there's no staleness risk
-// worth caching against.
-export async function sendInvoice(input: {
-  id: string;
-}): Promise<{ ok: true } | { ok: false; error: string }> {
-  const owner = await requirePlatformOwner();
+type BuiltInvoicePdf = {
+  pdfBytes: Uint8Array;
+  pdfPath: string;
+  invoiceNumber: string;
+  companyName: string;
+  periodLabel: string;
+  amountDue: number;
+  billingEmail: string | null;
+};
 
+// Shared by sendInvoice and previewInvoicePdf: builds the PDF from current
+// invoice/company/platform-settings data, uploads it (upsert — regenerating
+// is always safe, drafts can still change up until sent/paid locks them), and
+// stamps pdf_path. Deliberately doesn't require a billing_email — Preview and
+// the manual-delivery path both need to work for companies that don't have
+// one yet.
+async function buildAndStoreInvoicePdf(
+  invoiceId: string,
+): Promise<{ ok: true; data: BuiltInvoicePdf } | { ok: false; error: string }> {
   const { data: invoice, error: invErr } = await supabaseAdmin
     .from("invoices")
     .select(
-      "id, company_id, company_name, period_month, cash_fares_total, fee_percent, ride_count, amount_due, invoice_number, status",
+      "id, company_id, company_name, period_month, cash_fares_total, fee_percent, ride_count, amount_due, invoice_number",
     )
-    .eq("id", input.id)
+    .eq("id", invoiceId)
     .maybeSingle();
   if (invErr) return { ok: false, error: invErr.message };
   if (!invoice) return { ok: false, error: "Invoice not found." };
@@ -365,12 +375,6 @@ export async function sendInvoice(input: {
     .eq("id", invoice.company_id)
     .maybeSingle();
   if (companyErr) return { ok: false, error: companyErr.message };
-  if (!company?.billing_email) {
-    return {
-      ok: false,
-      error: "Add a billing email for this company first (Companies → Edit).",
-    };
-  }
 
   const settingsRes = await getPlatformSettings();
   if (!settingsRes.ok) return { ok: false, error: settingsRes.error };
@@ -392,7 +396,7 @@ export async function sendInvoice(input: {
     periodLabel,
     issueDate,
     companyName: invoice.company_name,
-    billingAddress: company.billing_address,
+    billingAddress: company?.billing_address ?? null,
     cashFaresTotal: Number(invoice.cash_fares_total),
     feePercent: Number(invoice.fee_percent),
     rideCount: invoice.ride_count,
@@ -409,6 +413,58 @@ export async function sendInvoice(input: {
     });
   if (uploadErr) return { ok: false, error: uploadErr.message };
 
+  const { error: updateErr } = await supabaseAdmin
+    .from("invoices")
+    .update({ pdf_path: pdfPath })
+    .eq("id", invoiceId);
+  if (updateErr) return { ok: false, error: updateErr.message };
+
+  return {
+    ok: true,
+    data: {
+      pdfBytes,
+      pdfPath,
+      invoiceNumber,
+      companyName: invoice.company_name,
+      periodLabel,
+      amountDue: Number(invoice.amount_due),
+      billingEmail: company?.billing_email ?? null,
+    },
+  };
+}
+
+// Generate/refresh the PDF and return a signed download URL — used for the
+// "Preview / Download PDF" button, before or instead of sending. Same builder
+// sendInvoice uses, just without emailing or touching status.
+export async function previewInvoicePdf(input: {
+  id: string;
+}): Promise<{ ok: true; url: string } | { ok: false; error: string }> {
+  await requirePlatformOwner();
+  const built = await buildAndStoreInvoicePdf(input.id);
+  if (!built.ok) return built;
+  return getInvoicePdfUrl({ pdfPath: built.data.pdfPath });
+}
+
+// Generate the PDF and email it to the company's billing contact, then flip
+// the invoice to sent.
+export async function sendInvoice(input: {
+  id: string;
+}): Promise<{ ok: true } | { ok: false; error: string }> {
+  const owner = await requirePlatformOwner();
+
+  const built = await buildAndStoreInvoicePdf(input.id);
+  if (!built.ok) return built;
+  const { pdfBytes, pdfPath, invoiceNumber, companyName, periodLabel, amountDue, billingEmail } =
+    built.data;
+
+  if (!billingEmail) {
+    return {
+      ok: false,
+      error:
+        "Add a billing email for this company first (Companies → Edit) — or use Preview / Download PDF to send it manually.",
+    };
+  }
+
   const base64Pdf = Buffer.from(pdfBytes).toString("base64");
   const res = await fetch("https://api.resend.com/emails", {
     method: "POST",
@@ -418,9 +474,9 @@ export async function sendInvoice(input: {
     },
     body: JSON.stringify({
       from: RESEND_FROM_ADDRESS,
-      to: company.billing_email,
-      subject: `${invoiceNumber} — ${invoice.company_name} platform fee invoice (${periodLabel})`,
-      html: `<p>Attached is your platform fee invoice for ${periodLabel} — $${Number(invoice.amount_due).toFixed(2)} due.</p>`,
+      to: billingEmail,
+      subject: `${invoiceNumber} — ${companyName} platform fee invoice (${periodLabel})`,
+      html: `<p>Attached is your platform fee invoice for ${periodLabel} — $${amountDue.toFixed(2)} due.</p>`,
       attachments: [
         { filename: `${invoiceNumber}.pdf`, content: base64Pdf, content_type: "application/pdf" },
       ],
@@ -433,7 +489,7 @@ export async function sendInvoice(input: {
 
   const { error: updateErr } = await supabaseAdmin
     .from("invoices")
-    .update({ status: "sent", sent_at: new Date().toISOString(), pdf_path: pdfPath })
+    .update({ status: "sent", sent_at: new Date().toISOString() })
     .eq("id", input.id);
   if (updateErr) return { ok: false, error: updateErr.message };
 
@@ -442,7 +498,7 @@ export async function sendInvoice(input: {
     projectSlug: "mgcj",
     action: "invoice.send",
     target: input.id,
-    after: { billing_email: company.billing_email, pdf_path: pdfPath },
+    after: { billing_email: billingEmail, pdf_path: pdfPath },
   });
 
   return { ok: true };
