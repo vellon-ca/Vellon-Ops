@@ -26,7 +26,7 @@ function missingMigrationMsg(err: {
       err.message,
     );
   return missing
-    ? "Revenue needs three migrations applied, in order: 20260718_ride_completed_at.sql then 20260714_ops_revenue.sql in the mgcj SQL editor (then NOTIFY pgrst, 'reload schema'), and 0002_invoices.sql in the vellon-ops hub SQL editor."
+    ? "Revenue needs four migrations applied, in order: 20260718_ride_completed_at.sql, 20260714_ops_revenue.sql, then 20260719_ride_fee_percent_snapshot.sql in the mgcj SQL editor (then NOTIFY pgrst, 'reload schema'), and 0002_invoices.sql in the vellon-ops hub SQL editor."
     : null;
 }
 
@@ -249,14 +249,15 @@ export async function generateInvoices(input: {
   // but sum defensively in case of any boundary duplication).
   const perCompany = new Map<
     string,
-    { name: string; feePct: number; fares: number; rides: number }
+    { name: string; feePct: number; fares: number; feeTotal: number; rides: number }
   >();
   for (const r of rows) {
     if (r.payment_method !== "cash") continue;
     const e =
       perCompany.get(r.company_id) ??
-      { name: r.company_name, feePct: r.fee_percent, fares: 0, rides: 0 };
+      { name: r.company_name, feePct: r.fee_percent, fares: 0, feeTotal: 0, rides: 0 };
     e.fares += r.fares_total;
+    e.feeTotal += r.fee_total;
     e.rides += r.ride_count;
     e.feePct = r.fee_percent;
     e.name = r.company_name;
@@ -290,7 +291,11 @@ export async function generateInvoices(input: {
       period_month: first,
       cash_fares_total: round2(e.fares),
       fee_percent: e.feePct,
-      amount_due: round2((e.fares * e.feePct) / 100),
+      // Sourced from the RPC's own per-ride fee_total (frozen per-ride rate),
+      // never re-derived from fares*feePct — a mid-period rate change means
+      // feePct is only a blended display value, not something the dollar
+      // amount can be recomputed from.
+      amount_due: round2(e.feeTotal),
       ride_count: e.rides,
       status: "draft",
       generated_by: owner.id,
