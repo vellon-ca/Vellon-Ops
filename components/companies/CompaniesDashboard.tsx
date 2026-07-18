@@ -7,7 +7,7 @@ import { EditCompanyModal } from "./EditCompanyModal";
 
 // The overall onboarding state a row is in, derived from its pieces.
 function overallStatus(r: CompanyRow): { text: string; className: string } {
-  if (!r.dispatcherName)
+  if (!r.adminName)
     return {
       text: "Needs setup",
       className: "border-zinc-700 bg-zinc-800/40 text-zinc-300",
@@ -69,7 +69,8 @@ export function CompaniesDashboard() {
           <thead>
             <tr className="border-b border-zinc-800 text-xs uppercase tracking-wide text-zinc-500">
               <th className="px-4 py-3 font-medium">Company</th>
-              <th className="px-4 py-3 font-medium">Dispatcher</th>
+              <th className="px-4 py-3 font-medium">Admin</th>
+              <th className="px-4 py-3 font-medium">Dispatchers</th>
               <th className="px-4 py-3 font-medium">Drivers</th>
               <th className="px-4 py-3 font-medium">Stripe</th>
               <th className="px-4 py-3 font-medium">Status</th>
@@ -79,14 +80,14 @@ export function CompaniesDashboard() {
           <tbody>
             {rows === null && (
               <tr>
-                <td colSpan={6} className="px-4 py-6 text-center text-zinc-500">
+                <td colSpan={7} className="px-4 py-6 text-center text-zinc-500">
                   Loading…
                 </td>
               </tr>
             )}
             {rows?.length === 0 && (
               <tr>
-                <td colSpan={6} className="px-4 py-6 text-center text-zinc-500">
+                <td colSpan={7} className="px-4 py-6 text-center text-zinc-500">
                   No companies yet.{" "}
                   <Link href="/onboarding" className="text-accent">
                     Onboard one →
@@ -96,15 +97,22 @@ export function CompaniesDashboard() {
             )}
             {rows?.map((r) => {
               const status = overallStatus(r);
-              const incomplete = !(r.dispatcherName && r.stripeOnboarded);
+              const incomplete = !(r.adminName && r.stripeOnboarded);
               return (
                 <tr key={r.id} className="border-b border-zinc-900 last:border-0">
                   <td className="px-4 py-3 font-medium text-zinc-100">{r.name}</td>
                   <td className="px-4 py-3 text-zinc-400">
-                    {r.dispatcherName ? (
-                      <span className="text-zinc-300">✅ {r.dispatcherName}</span>
+                    {r.adminName ? (
+                      <span className="text-zinc-300">✅ {r.adminName}</span>
                     ) : (
                       <span className="text-zinc-600">— none yet</span>
+                    )}
+                  </td>
+                  <td className="px-4 py-3 text-zinc-400">
+                    {r.dispatcherCount > 0 ? (
+                      `${r.dispatcherCount} dispatcher${r.dispatcherCount === 1 ? "" : "s"}`
+                    ) : (
+                      <span className="text-zinc-600">—</span>
                     )}
                   </td>
                   <td className="px-4 py-3 text-zinc-400">

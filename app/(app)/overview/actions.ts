@@ -94,7 +94,7 @@ export async function getOverview(): Promise<
   const attention: { name: string; issue: string }[] = [];
   let ready = 0;
   for (const c of companies) {
-    if (!c.dispatcherName) attention.push({ name: c.name, issue: "No dispatcher yet" });
+    if (!c.adminName) attention.push({ name: c.name, issue: "No admin yet" });
     else if (!c.stripeOnboarded)
       attention.push({ name: c.name, issue: "Stripe not finished" });
     else ready++;
@@ -160,7 +160,7 @@ export async function getOverview(): Promise<
   const portfolio: Overview["portfolio"] = companies.map((c) => ({
     companyId: c.id,
     name: c.name,
-    onboardStatus: !c.dispatcherName
+    onboardStatus: !c.adminName
       ? "needs_setup"
       : c.stripeOnboarded
         ? "fully_ready"

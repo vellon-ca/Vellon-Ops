@@ -92,8 +92,15 @@ export async function createCompany(input: {
   return { ok: true, data: { companyId: data.id, name } };
 }
 
-// ── Step 2: create first dispatcher (phone-OTP admin) ───────────────
-export async function createDispatcher(input: {
+// ── Step 2: create the company's admin (phone-OTP, vendor-provisioned) ──
+// Admin accounts are a vendor-managed seat — Vellon provisions them here via
+// service role, never self-serve — see mgcj-app's
+// 20260715_dispatcher_role_split.sql / 20260716_dispatcher_only_management.sql.
+// Every company needs exactly one to start; additional staff below this level
+// are 'dispatcher' rows, which the admin themself provisions from the
+// dashboard's own create-staff-account flow, and which this wizard can also
+// optionally seed at onboarding time via createDispatchers.
+export async function createAdmin(input: {
   companyId: string;
   name: string;
   phone: string;
@@ -102,7 +109,7 @@ export async function createDispatcher(input: {
 
   const name = input.name.trim();
   const phone = input.phone.trim();
-  if (!name) return { ok: false, error: "Dispatcher name is required." };
+  if (!name) return { ok: false, error: "Admin name is required." };
   if (!/^\+[1-9]\d{7,14}$/.test(phone))
     return { ok: false, error: "Phone must be E.164 format, e.g. +19025551234." };
 
@@ -149,7 +156,7 @@ export async function createDispatcher(input: {
   await writeAudit({
     actorUserId: owner.id,
     projectSlug: "mgcj",
-    action: "dispatcher.create",
+    action: "admin.create",
     target: created.user.id,
     after: { company_id: input.companyId, name, phone },
   });
@@ -157,7 +164,74 @@ export async function createDispatcher(input: {
   return { ok: true, data: { userId: created.user.id } };
 }
 
-// ── Step 3: mint driver invite codes ────────────────────────────────
+// ── Step 3 (optional): seed dispatcher accounts ─────────────────────
+// Day-to-day dispatch staff, distinct from the admin seat above — can
+// configure day-to-day dispatch (rides, drivers, announcements) but not
+// company pricing/config or other staff (see mgcj-app's
+// 20260715_dispatcher_role_split.sql). Normally an admin provisions these
+// themselves from the dashboard (create-staff-account Edge Function); this
+// just lets Vellon seed the first few at onboarding time so the company isn't
+// stuck with one login. Entirely optional — a company with only an admin is a
+// valid, complete onboarding.
+export type DispatcherResult = { userId: string; name: string; phone: string };
+
+export async function createDispatchers(input: {
+  companyId: string;
+  dispatchers: { name: string; phone: string }[];
+}): Promise<ActionResult<{ created: DispatcherResult[] }>> {
+  const owner = await requirePlatformOwner();
+
+  const dispatchers = input.dispatchers
+    .map((d) => ({ name: d.name.trim(), phone: d.phone.trim() }))
+    .filter((d) => d.name && d.phone);
+  if (dispatchers.length === 0) return { ok: true, data: { created: [] } };
+  for (const d of dispatchers) {
+    if (!/^\+[1-9]\d{7,14}$/.test(d.phone))
+      return { ok: false, error: `Invalid phone: ${d.phone} (use E.164, e.g. +19025551234).` };
+  }
+
+  const mgcj = mgcjSupabase();
+  const created: DispatcherResult[] = [];
+
+  for (const d of dispatchers) {
+    const { data: user, error: cErr } = await mgcj.auth.admin.createUser({
+      phone: d.phone,
+      phone_confirm: true,
+    });
+    if (cErr || !user.user)
+      return { ok: false, error: cErr?.message ?? `Failed to create account for ${d.phone}.` };
+
+    const { error: pErr } = await mgcj.from("profiles").upsert(
+      {
+        id: user.user.id,
+        role: "dispatcher",
+        company_id: input.companyId,
+        name: d.name,
+        phone: d.phone,
+        is_active: true,
+      },
+      { onConflict: "id" },
+    );
+    if (pErr) {
+      await mgcj.auth.admin.deleteUser(user.user.id);
+      return { ok: false, error: pErr.message };
+    }
+
+    created.push({ userId: user.user.id, name: d.name, phone: d.phone });
+  }
+
+  await writeAudit({
+    actorUserId: owner.id,
+    projectSlug: "mgcj",
+    action: "dispatcher.create",
+    target: input.companyId,
+    after: { count: created.length, dispatchers: created },
+  });
+
+  return { ok: true, data: { created } };
+}
+
+// ── Step 4: mint driver invite codes ────────────────────────────────
 function genCode() {
   // Unambiguous uppercase set (no 0/O/1/I).
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -371,14 +445,16 @@ export async function refreshStripeStatus(input: {
 // truth — rather than tracked in a separate table that could drift. Each
 // company's state falls out of what actually exists:
 //   • company row              → step 0 done (always, if it's in this list)
-//   • an admin profile         → dispatcher created
+//   • an admin profile         → admin created (required)
+//   • dispatcher profiles      → dispatchers seeded (optional step)
 //   • driver_invites rows      → invites minted (optional step)
 //   • stripe_account_id        → Stripe onboarding started
 //   • stripe_onboarded = true  → card-ready
 export type CompanyRow = {
   id: string;
   name: string;
-  dispatcherName: string | null;
+  adminName: string | null;
+  dispatcherCount: number;
   inviteCount: number;
   stripeAccountId: string | null;
   stripeOnboarded: boolean;
@@ -397,21 +473,34 @@ export async function listCompanies(): Promise<ActionResult<CompanyRow[]>> {
 
   const ids = companies.map((c) => c.id);
 
-  // First admin per company (their name), and invite counts. Both are small at
-  // this scale, so fetch the rows and fold in JS rather than N round-trips.
-  const [{ data: admins }, { data: invites }] = await Promise.all([
+  // First admin per company (their name), dispatcher counts, and invite
+  // counts. All small at this scale, so fetch the rows and fold in JS rather
+  // than N round-trips.
+  const [{ data: admins }, { data: dispatchers }, { data: invites }] = await Promise.all([
     mgcj
       .from("profiles")
       .select("company_id, name")
       .eq("role", "admin")
       .in("company_id", ids),
+    mgcj
+      .from("profiles")
+      .select("company_id")
+      .eq("role", "dispatcher")
+      .in("company_id", ids),
     mgcj.from("driver_invites").select("company_id").in("company_id", ids),
   ]);
 
-  const dispatcherByCompany = new Map<string, string | null>();
+  const adminByCompany = new Map<string, string | null>();
   for (const a of admins ?? [])
-    if (!dispatcherByCompany.has(a.company_id))
-      dispatcherByCompany.set(a.company_id, a.name ?? null);
+    if (!adminByCompany.has(a.company_id))
+      adminByCompany.set(a.company_id, a.name ?? null);
+
+  const dispatcherCountByCompany = new Map<string, number>();
+  for (const d of dispatchers ?? [])
+    dispatcherCountByCompany.set(
+      d.company_id,
+      (dispatcherCountByCompany.get(d.company_id) ?? 0) + 1,
+    );
 
   const inviteCountByCompany = new Map<string, number>();
   for (const inv of invites ?? [])
@@ -423,7 +512,8 @@ export async function listCompanies(): Promise<ActionResult<CompanyRow[]>> {
   const rows: CompanyRow[] = companies.map((c) => ({
     id: c.id,
     name: c.name,
-    dispatcherName: dispatcherByCompany.get(c.id) ?? null,
+    adminName: adminByCompany.get(c.id) ?? null,
+    dispatcherCount: dispatcherCountByCompany.get(c.id) ?? 0,
     inviteCount: inviteCountByCompany.get(c.id) ?? 0,
     stripeAccountId: (c.stripe_account_id as string | null) ?? null,
     stripeOnboarded: !!c.stripe_onboarded,
@@ -458,7 +548,7 @@ export async function getCompanyForEdit(
   if (error) return { ok: false, error: error.message };
   if (!company) return { ok: false, error: "Company not found." };
 
-  const [{ data: admin }, { count: inviteCount }] = await Promise.all([
+  const [{ data: admin }, { count: dispatcherCount }, { count: inviteCount }] = await Promise.all([
     mgcj
       .from("profiles")
       .select("name")
@@ -466,6 +556,11 @@ export async function getCompanyForEdit(
       .eq("role", "admin")
       .limit(1)
       .maybeSingle(),
+    mgcj
+      .from("profiles")
+      .select("id", { count: "exact", head: true })
+      .eq("company_id", companyId)
+      .eq("role", "dispatcher"),
     mgcj
       .from("driver_invites")
       .select("id", { count: "exact", head: true })
@@ -477,7 +572,8 @@ export async function getCompanyForEdit(
     data: {
       id: company.id,
       name: company.name,
-      dispatcherName: admin?.name ?? null,
+      adminName: admin?.name ?? null,
+      dispatcherCount: dispatcherCount ?? 0,
       inviteCount: inviteCount ?? 0,
       stripeAccountId: (company.stripe_account_id as string | null) ?? null,
       stripeOnboarded: !!company.stripe_onboarded,

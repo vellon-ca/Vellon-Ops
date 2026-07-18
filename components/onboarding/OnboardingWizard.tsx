@@ -4,17 +4,19 @@ import { useEffect, useRef, useState, useTransition } from "react";
 import { useSearchParams } from "next/navigation";
 import {
   createCompany,
-  createDispatcher,
+  createAdmin,
+  createDispatchers,
   addInvites,
   startStripeOnboarding,
   refreshStripeStatus,
   getCompanyForEdit,
   type InviteResult,
+  type DispatcherResult,
   type StripeStatus,
   type CompanyDetail,
 } from "@/app/(app)/onboarding/actions";
 
-const STEPS = ["Company", "Dispatcher", "Invites", "Stripe", "Done"] as const;
+const STEPS = ["Company", "Admin", "Dispatchers", "Invites", "Stripe", "Done"] as const;
 
 const input =
   "w-full rounded-md border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-zinc-100 outline-none focus:border-accent";
@@ -30,13 +32,14 @@ type CompanyInput = {
   billingAddress: string;
 };
 
-// The first step of a resumed company that still has real work left. company +
-// dispatcher are the required steps; invites and Stripe are optional/skippable,
-// so we never bounce a resumed run back to step 0 or 1 once they're done.
+// The first step of a resumed company that still has real work left. Company +
+// Admin are the required steps; Dispatchers, Invites, and Stripe are
+// optional/skippable, so we never bounce a resumed run back to step 0 or 1
+// once they're done.
 function resumeStep(r: CompanyDetail): number {
-  if (!r.dispatcherName) return 1; // Dispatcher
-  if (r.stripeOnboarded || r.stripeAccountId) return 3; // Stripe (ready or in-progress)
-  return 2; // dispatcher done, Stripe not started → offer invites next
+  if (!r.adminName) return 1; // Admin
+  if (r.stripeOnboarded || r.stripeAccountId) return 4; // Stripe (ready or in-progress)
+  return 2; // admin done, Stripe not started → offer dispatchers next
 }
 
 export function OnboardingWizard() {
@@ -50,7 +53,9 @@ export function OnboardingWizard() {
   // carried state
   const [companyId, setCompanyId] = useState<string | null>(null);
   const [companyName, setCompanyName] = useState("");
-  const [dispatcherId, setDispatcherId] = useState<string | null>(null);
+  const [adminId, setAdminId] = useState<string | null>(null);
+  const [dispatcherRows, setDispatcherRows] = useState([{ name: "", phone: "" }]);
+  const [dispatchersCreated, setDispatchersCreated] = useState<DispatcherResult[]>([]);
   const [invites, setInvites] = useState<InviteResult[]>([]);
   const [driverRows, setDriverRows] = useState([{ name: "", phone: "" }]);
   const [stripe, setStripe] = useState<StripeStatus | null>(null);
@@ -73,7 +78,9 @@ export function OnboardingWizard() {
     setStep(0);
     setCompanyId(null);
     setCompanyName("");
-    setDispatcherId(null);
+    setAdminId(null);
+    setDispatcherRows([{ name: "", phone: "" }]);
+    setDispatchersCreated([]);
     setInvites([]);
     setDriverRows([{ name: "", phone: "" }]);
     setStripe(null);
@@ -274,23 +281,26 @@ export function OnboardingWizard() {
               e.preventDefault();
               const f = new FormData(e.currentTarget);
               run(async () => {
-                const res = await createDispatcher({
+                const res = await createAdmin({
                   companyId: companyId!,
                   name: String(f.get("dname")),
                   phone: String(f.get("dphone")),
                 });
                 if (!res.ok) return setError(res.error);
-                setDispatcherId(res.data.userId);
+                setAdminId(res.data.userId);
                 setStep(2);
               });
             }}
           >
             <p className="text-sm text-zinc-500">
-              First dispatcher for <span className="text-zinc-300">{companyName}</span>.
-              They log into the dashboard with this phone via OTP.
+              Admin for <span className="text-zinc-300">{companyName}</span> — can
+              configure pricing, vehicle classes, and other staff, in addition to
+              day-to-day dispatch. Every company needs one; this is a
+              vendor-provisioned seat. They log into the dashboard with this phone
+              via OTP.
             </p>
             <div className="space-y-1.5">
-              <label className={label}>Dispatcher name</label>
+              <label className={label}>Admin name</label>
               <input name="dname" required className={input} />
             </div>
             <div className="space-y-1.5">
@@ -307,7 +317,7 @@ export function OnboardingWizard() {
               disabled={pending}
               className="w-full rounded-md bg-accent px-3 py-2 text-sm font-medium text-white hover:bg-accent-hover disabled:opacity-50"
             >
-              {pending ? "Creating…" : "Create dispatcher"}
+              {pending ? "Creating…" : "Create admin"}
             </button>
           </form>
         )}
@@ -318,14 +328,109 @@ export function OnboardingWizard() {
             onSubmit={(e) => {
               e.preventDefault();
               run(async () => {
+                const res = await createDispatchers({
+                  companyId: companyId!,
+                  dispatchers: dispatcherRows.filter(
+                    (d) => d.name.trim() && d.phone.trim(),
+                  ),
+                });
+                if (!res.ok) return setError(res.error);
+                setDispatchersCreated(res.data.created);
+                setStep(3);
+              });
+            }}
+          >
+            <p className="text-sm text-zinc-500">
+              Optionally add dispatchers for {companyName} — day-to-day dispatch
+              staff who can't touch pricing/config or other staff. Admins can also
+              add these later from the dashboard itself.
+            </p>
+            <div className="space-y-2">
+              {dispatcherRows.map((row, i) => (
+                <div key={i} className="flex gap-2">
+                  <input
+                    placeholder="Name"
+                    value={row.name}
+                    onChange={(e) =>
+                      setDispatcherRows((rows) =>
+                        rows.map((r, j) =>
+                          j === i ? { ...r, name: e.target.value } : r,
+                        ),
+                      )
+                    }
+                    className={input}
+                  />
+                  <input
+                    placeholder="+19025551234"
+                    value={row.phone}
+                    onChange={(e) =>
+                      setDispatcherRows((rows) =>
+                        rows.map((r, j) =>
+                          j === i ? { ...r, phone: e.target.value } : r,
+                        ),
+                      )
+                    }
+                    className={input}
+                  />
+                  {dispatcherRows.length > 1 && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setDispatcherRows((rows) => rows.filter((_, j) => j !== i))
+                      }
+                      className="shrink-0 rounded-md border border-zinc-700 px-3 text-sm text-zinc-400 hover:bg-zinc-800/50"
+                    >
+                      ✕
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+            <button
+              type="button"
+              onClick={() =>
+                setDispatcherRows((rows) => [...rows, { name: "", phone: "" }])
+              }
+              className="text-xs text-accent hover:text-accent-hover"
+            >
+              + Add another dispatcher
+            </button>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setDispatchersCreated([]);
+                  setStep(3);
+                }}
+                className="rounded-md border border-zinc-700 px-3 py-2 text-sm text-zinc-400 hover:bg-zinc-800/50"
+              >
+                Skip for now
+              </button>
+              <button
+                type="submit"
+                disabled={pending}
+                className="flex-1 rounded-md bg-accent px-3 py-2 text-sm font-medium text-white hover:bg-accent-hover disabled:opacity-50"
+              >
+                {pending ? "Creating…" : "Create dispatchers"}
+              </button>
+            </div>
+          </form>
+        )}
+
+        {step === 3 && (
+          <form
+            className="space-y-4"
+            onSubmit={(e) => {
+              e.preventDefault();
+              run(async () => {
                 const res = await addInvites({
                   companyId: companyId!,
                   drivers: driverRows.filter((d) => d.phone.trim()),
-                  createdBy: dispatcherId,
+                  createdBy: adminId,
                 });
                 if (!res.ok) return setError(res.error);
                 setInvites(res.data.invites);
-                setStep(3);
+                setStep(4);
               });
             }}
           >
@@ -388,7 +493,7 @@ export function OnboardingWizard() {
                 type="button"
                 onClick={() => {
                   setInvites([]);
-                  setStep(3);
+                  setStep(4);
                 }}
                 className="rounded-md border border-zinc-700 px-3 py-2 text-sm text-zinc-400 hover:bg-zinc-800/50"
               >
@@ -405,7 +510,7 @@ export function OnboardingWizard() {
           </form>
         )}
 
-        {step === 3 && (
+        {step === 4 && (
           <div className="space-y-4">
             <p className="text-sm text-zinc-500">
               Set up Stripe payouts for {companyName}. This creates a Connect
@@ -490,7 +595,7 @@ export function OnboardingWizard() {
             <div className="flex gap-2 pt-2">
               <button
                 type="button"
-                onClick={() => setStep(4)}
+                onClick={() => setStep(5)}
                 className="w-full rounded-md border border-zinc-700 px-3 py-2 text-sm text-zinc-300 hover:bg-zinc-800/50"
               >
                 {stripe?.chargesEnabled ? "Finish" : "Skip / finish later"}
@@ -499,14 +604,15 @@ export function OnboardingWizard() {
           </div>
         )}
 
-        {step === 4 && (
+        {step === 5 && (
           <div className="space-y-4">
             <div>
               <p className="text-sm font-medium text-zinc-200">
                 ✅ {companyName} onboarded
               </p>
               <p className="mt-1 text-xs text-zinc-500">
-                Dispatcher created · {invites.length} driver invite
+                Admin created · {dispatchersCreated.length} dispatcher
+                {dispatchersCreated.length === 1 ? "" : "s"} · {invites.length} driver invite
                 {invites.length === 1 ? "" : "s"} generated
               </p>
             </div>
