@@ -1,15 +1,17 @@
 "use client";
 
 import { useEffect, useRef, useState, useTransition } from "react";
+import { useSearchParams } from "next/navigation";
 import {
   createCompany,
   createDispatcher,
   addInvites,
   startStripeOnboarding,
   refreshStripeStatus,
+  getCompanyForEdit,
   type InviteResult,
   type StripeStatus,
-  type CompanyRow,
+  type CompanyDetail,
 } from "@/app/(app)/onboarding/actions";
 
 const STEPS = ["Company", "Dispatcher", "Invites", "Stripe", "Done"] as const;
@@ -24,24 +26,23 @@ type CompanyInput = {
   baseFare: number;
   ratePerKm: number;
   hstNumber: string;
+  billingEmail: string;
+  billingAddress: string;
 };
 
 // The first step of a resumed company that still has real work left. company +
 // dispatcher are the required steps; invites and Stripe are optional/skippable,
 // so we never bounce a resumed run back to step 0 or 1 once they're done.
-function resumeStep(r: CompanyRow): number {
+function resumeStep(r: CompanyDetail): number {
   if (!r.dispatcherName) return 1; // Dispatcher
   if (r.stripeOnboarded || r.stripeAccountId) return 3; // Stripe (ready or in-progress)
   return 2; // dispatcher done, Stripe not started → offer invites next
 }
 
-export function OnboardingWizard({
-  resume,
-  onChanged,
-}: {
-  resume?: CompanyRow | null;
-  onChanged?: () => void;
-}) {
+export function OnboardingWizard() {
+  // Companies page links here as /onboarding?resume=<id> for anything not
+  // yet fully onboarded — fetch that company and seed the wizard with it.
+  const resumeId = useSearchParams().get("resume");
   const [step, setStep] = useState(0);
   const [pending, startTransition] = useTransition();
   const [error, setError] = useState<string | null>(null);
@@ -81,27 +82,34 @@ export function OnboardingWizard({
     setError(null);
   }
 
-  // Seed the wizard when the parent hands us a company to resume. The parent
-  // passes a fresh object per Resume click, so identity change = re-seed.
-  const prevResume = useRef<CompanyRow | null>(null);
+  // Seed the wizard from ?resume=<id>. Guard on the id itself (not object
+  // identity, since we fetch fresh) so this only fires once per distinct id.
+  const prevResumeId = useRef<string | null>(null);
   useEffect(() => {
-    if (!resume || resume === prevResume.current) return;
-    prevResume.current = resume;
-    resetWizard();
-    setCompanyId(resume.id);
-    setCompanyName(resume.name);
-    setStep(resumeStep(resume));
-    // Pull live Stripe state (and a fresh link) if an account already exists.
-    if (resume.stripeAccountId) {
-      startTransition(async () => {
-        const res = await refreshStripeStatus({ companyId: resume.id });
-        if (res.ok) {
-          setStripe(res.data);
-          setStripeCheckedAt(new Date().toLocaleTimeString());
-        }
-      });
-    }
-  }, [resume]);
+    if (!resumeId || resumeId === prevResumeId.current) return;
+    prevResumeId.current = resumeId;
+    getCompanyForEdit(resumeId).then((res) => {
+      if (!res.ok) {
+        setError(res.error);
+        return;
+      }
+      const resume = res.data;
+      resetWizard();
+      setCompanyId(resume.id);
+      setCompanyName(resume.name);
+      setStep(resumeStep(resume));
+      // Pull live Stripe state (and a fresh link) if an account already exists.
+      if (resume.stripeAccountId) {
+        startTransition(async () => {
+          const stripeRes = await refreshStripeStatus({ companyId: resume.id });
+          if (stripeRes.ok) {
+            setStripe(stripeRes.data);
+            setStripeCheckedAt(new Date().toLocaleTimeString());
+          }
+        });
+      }
+    });
+  }, [resumeId]);
 
   function submitCompany(data: CompanyInput, force: boolean) {
     run(async () => {
@@ -111,6 +119,8 @@ export function OnboardingWizard({
         baseFare: data.baseFare,
         ratePerKm: data.ratePerKm,
         hstNumber: data.hstNumber,
+        billingEmail: data.billingEmail,
+        billingAddress: data.billingAddress,
         studentDiscountEnabled: false,
         force,
       });
@@ -123,7 +133,6 @@ export function OnboardingWizard({
       setCompanyId(res.data.companyId);
       setCompanyName(res.data.name);
       setStep(1);
-      onChanged?.();
     });
   }
 
@@ -185,6 +194,8 @@ export function OnboardingWizard({
                   baseFare: Number(f.get("base")),
                   ratePerKm: Number(f.get("rate")),
                   hstNumber: String(f.get("hst") || ""),
+                  billingEmail: String(f.get("billingEmail") || ""),
+                  billingAddress: String(f.get("billingAddress") || ""),
                 },
                 false,
               );
@@ -233,6 +244,19 @@ export function OnboardingWizard({
               <label className={label}>HST number (optional)</label>
               <input name="hst" className={input} />
             </div>
+            <div className="space-y-1.5">
+              <label className={label}>Billing email (optional — can add later)</label>
+              <input
+                name="billingEmail"
+                type="email"
+                placeholder="billing@companyname.com"
+                className={input}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <label className={label}>Billing address (optional — can add later)</label>
+              <input name="billingAddress" className={input} />
+            </div>
             <button
               type="submit"
               disabled={pending}
@@ -258,7 +282,6 @@ export function OnboardingWizard({
                 if (!res.ok) return setError(res.error);
                 setDispatcherId(res.data.userId);
                 setStep(2);
-                onChanged?.();
               });
             }}
           >
@@ -303,7 +326,6 @@ export function OnboardingWizard({
                 if (!res.ok) return setError(res.error);
                 setInvites(res.data.invites);
                 setStep(3);
-                onChanged?.();
               });
             }}
           >
@@ -402,7 +424,6 @@ export function OnboardingWizard({
                     });
                     if (!res.ok) return setError(res.error);
                     setStripe(res.data);
-                    onChanged?.();
                   })
                 }
                 className="w-full rounded-md bg-accent px-3 py-2 text-sm font-medium text-white hover:bg-accent-hover disabled:opacity-50"
@@ -439,7 +460,6 @@ export function OnboardingWizard({
                           if (!res.ok) return setError(res.error);
                           setStripe(res.data);
                           setStripeCheckedAt(new Date().toLocaleTimeString());
-                          onChanged?.();
                         })
                       }
                       className="w-full rounded-md border border-zinc-700 px-3 py-2 text-sm text-zinc-300 hover:bg-zinc-800/50 disabled:opacity-50"

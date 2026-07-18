@@ -1,13 +1,12 @@
 "use client";
 
-import { useEffect, useState, useTransition } from "react";
+import { useCallback, useEffect, useState } from "react";
+import Link from "next/link";
 import { listCompanies, type CompanyRow } from "@/app/(app)/onboarding/actions";
+import { EditCompanyModal } from "./EditCompanyModal";
 
 // The overall onboarding state a row is in, derived from its pieces.
-function overallStatus(r: CompanyRow): {
-  text: string;
-  className: string;
-} {
+function overallStatus(r: CompanyRow): { text: string; className: string } {
   if (!r.dispatcherName)
     return {
       text: "Needs setup",
@@ -32,35 +31,31 @@ function StripeCell({ r }: { r: CompanyRow }) {
   return <span className="text-zinc-600">— not started</span>;
 }
 
-export function CompaniesTable({
-  reloadNonce,
-  onResume,
-}: {
-  reloadNonce: number;
-  onResume: (r: CompanyRow) => void;
-}) {
+export function CompaniesDashboard() {
   const [rows, setRows] = useState<CompanyRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [, startTransition] = useTransition();
+  const [editing, setEditing] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    const res = await listCompanies();
+    if (res.ok) {
+      setRows(res.data);
+      setError(null);
+    } else {
+      setError(res.error);
+    }
+  }, []);
 
   useEffect(() => {
-    startTransition(async () => {
-      const res = await listCompanies();
-      if (res.ok) {
-        setRows(res.data);
-        setError(null);
-      } else {
-        setError(res.error);
-      }
-    });
-  }, [reloadNonce]);
+    load();
+  }, [load]);
 
   return (
-    <div className="mt-12">
-      <h2 className="text-sm font-semibold text-zinc-300">Companies</h2>
-      <p className="mt-1 text-xs text-zinc-500">
-        Every company in the mgcj backend and where its onboarding stands. Pick
-        up an unfinished one instead of starting over.
+    <div>
+      <h1 className="text-xl font-semibold text-zinc-100">Companies</h1>
+      <p className="mt-1 text-sm text-zinc-500">
+        Every company in the mgcj backend — fee/fare/billing details, onboarding
+        progress, and Stripe status.
       </p>
 
       {error && (
@@ -70,7 +65,7 @@ export function CompaniesTable({
       )}
 
       <div className="mt-4 overflow-x-auto rounded-xl border border-zinc-800">
-        <table className="w-full min-w-[640px] text-left text-sm">
+        <table className="w-full min-w-[720px] text-left text-sm">
           <thead>
             <tr className="border-b border-zinc-800 text-xs uppercase tracking-wide text-zinc-500">
               <th className="px-4 py-3 font-medium">Company</th>
@@ -92,25 +87,22 @@ export function CompaniesTable({
             {rows?.length === 0 && (
               <tr>
                 <td colSpan={6} className="px-4 py-6 text-center text-zinc-500">
-                  No companies yet. Onboard one above.
+                  No companies yet.{" "}
+                  <Link href="/onboarding" className="text-accent">
+                    Onboard one →
+                  </Link>
                 </td>
               </tr>
             )}
             {rows?.map((r) => {
               const status = overallStatus(r);
+              const incomplete = !(r.dispatcherName && r.stripeOnboarded);
               return (
-                <tr
-                  key={r.id}
-                  className="border-b border-zinc-900 last:border-0"
-                >
-                  <td className="px-4 py-3 font-medium text-zinc-100">
-                    {r.name}
-                  </td>
+                <tr key={r.id} className="border-b border-zinc-900 last:border-0">
+                  <td className="px-4 py-3 font-medium text-zinc-100">{r.name}</td>
                   <td className="px-4 py-3 text-zinc-400">
                     {r.dispatcherName ? (
-                      <span className="text-zinc-300">
-                        ✅ {r.dispatcherName}
-                      </span>
+                      <span className="text-zinc-300">✅ {r.dispatcherName}</span>
                     ) : (
                       <span className="text-zinc-600">— none yet</span>
                     )}
@@ -136,15 +128,23 @@ export function CompaniesTable({
                     </span>
                   </td>
                   <td className="px-4 py-3 text-right">
-                    {!(r.dispatcherName && r.stripeOnboarded) && (
+                    <div className="flex items-center justify-end gap-2">
+                      {incomplete && (
+                        <Link
+                          href={`/onboarding?resume=${r.id}`}
+                          className="rounded-md border border-zinc-700 px-3 py-1.5 text-xs text-zinc-300 hover:bg-zinc-800/50"
+                        >
+                          Resume onboarding →
+                        </Link>
+                      )}
                       <button
                         type="button"
-                        onClick={() => onResume(r)}
+                        onClick={() => setEditing(r.id)}
                         className="rounded-md border border-zinc-700 px-3 py-1.5 text-xs text-zinc-300 hover:bg-zinc-800/50"
                       >
-                        Resume
+                        Edit
                       </button>
-                    )}
+                    </div>
                   </td>
                 </tr>
               );
@@ -152,6 +152,17 @@ export function CompaniesTable({
           </tbody>
         </table>
       </div>
+
+      {editing && (
+        <EditCompanyModal
+          companyId={editing}
+          onClose={() => setEditing(null)}
+          onSaved={() => {
+            setEditing(null);
+            load();
+          }}
+        />
+      )}
     </div>
   );
 }
