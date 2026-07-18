@@ -31,5 +31,5 @@ export async function login(formData: FormData) {
     redirect("/login?denied=1");
   }
 
-  redirect("/overview");
+  redirect("/projects");
 }

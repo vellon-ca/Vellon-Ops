@@ -6,6 +6,8 @@ import {
   generateInvoices,
   listInvoices,
   updateInvoiceStatus,
+  sendInvoice,
+  previewInvoicePdf,
   type RevenueSummary,
   type Invoice,
 } from "@/app/(app)/revenue/actions";
@@ -219,10 +221,29 @@ function Tile({
   );
 }
 
-// ── Monthly fee trend: stacked bars (cash + card) with a hover tooltip ──
+// Round a scale max up to a "clean" step (1/2/2.5/5/10 × a power of ten) so
+// axis ticks read as real numbers, not fractions of whatever the biggest bar happened to be.
+function niceCeil(n: number): number {
+  if (n <= 0) return 100;
+  const magnitude = Math.pow(10, Math.floor(Math.log10(n)));
+  const residual = n / magnitude;
+  const step = [1, 2, 2.5, 5, 10].find((s) => s >= residual) ?? 10;
+  return step * magnitude;
+}
+
+const compactCad = (n: number) =>
+  new Intl.NumberFormat("en-CA", {
+    style: "currency",
+    currency: "CAD",
+    maximumFractionDigits: 0,
+  }).format(n);
+
+// ── Monthly fee trend: stacked bars (cash + card) with axis + hover tooltip ──
 function FeeTrend({ data }: { data: RevenueSummary["byMonth"] }) {
   const [hover, setHover] = useState<number | null>(null);
-  const max = Math.max(1, ...data.map((d) => d.totalFee));
+  const niceMax = niceCeil(Math.max(1, ...data.map((d) => d.totalFee)));
+  const ticks = [niceMax, (niceMax * 3) / 4, niceMax / 2, niceMax / 4, 0];
+  const PLOT_H = 208; // px — matches h-52 below
 
   if (data.length === 0) return null;
 
@@ -244,72 +265,105 @@ function FeeTrend({ data }: { data: RevenueSummary["byMonth"] }) {
         </div>
       </div>
 
-      <div className="relative mt-4 rounded-xl border border-zinc-800 bg-zinc-900/40 p-4">
-        <div className="flex h-56 items-end gap-2">
-          {data.map((d, i) => {
-            const cashH = (d.cashFee / max) * 100;
-            const cardH = (d.cardFee / max) * 100;
-            const active = hover === i;
-            return (
-              <div
-                key={d.month}
-                className="group relative flex h-full flex-1 flex-col justify-end"
-                onMouseEnter={() => setHover(i)}
-                onMouseLeave={() => setHover(null)}
-              >
-                {/* total label */}
-                <div
-                  className={
-                    "mb-1 text-center text-[10px] tabular-nums " +
-                    (active ? "text-zinc-200" : "text-zinc-500")
-                  }
-                >
-                  {d.totalFee > 0 ? cad(d.totalFee).replace("CA", "") : ""}
-                </div>
-                {/* stacked bar: card on top, cash on bottom, 2px surface gap */}
-                <div className="flex flex-col items-stretch justify-end">
-                  {d.cardFee > 0 && (
-                    <div
-                      style={{
-                        height: `${Math.max(cardH, 1.5)}%`,
-                        background: CARD,
-                        opacity: active || hover === null ? 1 : 0.5,
-                      }}
-                      className="rounded-t"
-                    />
-                  )}
-                  {d.cashFee > 0 && (
-                    <div
-                      style={{
-                        height: `${Math.max(cashH, 1.5)}%`,
-                        background: CASH,
-                        marginTop: d.cardFee > 0 ? 2 : 0,
-                        opacity: active || hover === null ? 1 : 0.5,
-                      }}
-                      className={d.cardFee > 0 ? "rounded-b" : "rounded"}
-                    />
-                  )}
-                </div>
-                <div className="mt-1.5 text-center text-[10px] text-zinc-500">
-                  {monthLabel(d.month)}
-                </div>
+      <div className="mt-4 flex gap-3 rounded-xl border border-zinc-800 bg-zinc-900/40 p-4">
+        {/* y-axis ticks */}
+        <div
+          className="flex shrink-0 flex-col justify-between text-right text-[10px] tabular-nums text-zinc-600"
+          style={{ height: PLOT_H }}
+        >
+          {ticks.map((t) => (
+            <span key={t}>{compactCad(t)}</span>
+          ))}
+        </div>
 
-                {active && (
-                  <div className="pointer-events-none absolute -top-2 left-1/2 z-10 w-36 -translate-x-1/2 -translate-y-full rounded-lg border border-zinc-700 bg-zinc-950 p-2.5 text-xs shadow-xl">
-                    <p className="font-medium text-zinc-200">{monthLabel(d.month)}</p>
-                    <div className="mt-1.5 space-y-1">
-                      <Row color={CARD} label="Card" value={cad(d.cardFee)} />
-                      <Row color={CASH} label="Cash" value={cad(d.cashFee)} />
-                      <div className="mt-1 flex justify-between border-t border-zinc-800 pt-1 text-zinc-300">
-                        <span>Total</span>
-                        <span className="tabular-nums">{cad(d.totalFee)}</span>
+        <div className="relative min-w-0 flex-1">
+          {/* gridlines — hairline, recessive, one step off the surface */}
+          <div
+            className="absolute inset-x-0 top-0 flex flex-col justify-between"
+            style={{ height: PLOT_H }}
+          >
+            {ticks.map((t) => (
+              <div key={t} className="border-t border-zinc-800/60" />
+            ))}
+          </div>
+
+          <div className="relative flex items-end gap-1" style={{ height: PLOT_H }}>
+            {data.map((d, i) => {
+              // Pixel heights, not percentages — the stack wrapper below has
+              // no explicit height of its own (it sizes to content), so a
+              // percentage height on its children resolves against nothing
+              // and renders at 0px. Anchoring to PLOT_H sidesteps that.
+              const cardHpx = d.cardFee > 0 ? Math.max((d.cardFee / niceMax) * PLOT_H, 2) : 0;
+              const cashHpx = d.cashFee > 0 ? Math.max((d.cashFee / niceMax) * PLOT_H, 2) : 0;
+              const active = hover === i;
+              const hasCard = d.cardFee > 0;
+              const hasCash = d.cashFee > 0;
+              return (
+                <div
+                  key={d.month}
+                  className="group relative flex h-full flex-1 flex-col justify-end"
+                  onMouseEnter={() => setHover(i)}
+                  onMouseLeave={() => setHover(null)}
+                >
+                  {d.totalFee > 0 && (
+                    <div className="pointer-events-none mb-1 text-center text-[10px] tabular-nums text-zinc-300">
+                      {cad(d.totalFee)}
+                    </div>
+                  )}
+                  {/* capped-width stacked column: card (free end, rounded) on
+                      top, cash on the baseline (square) — 2px surface gap between */}
+                  <div className="mx-auto flex w-full max-w-[22px] flex-col items-stretch justify-end">
+                    {hasCard && (
+                      <div
+                        style={{
+                          height: `${cardHpx}px`,
+                          background: CARD,
+                          opacity: active || hover === null ? 1 : 0.5,
+                        }}
+                        className="rounded-t-[4px]"
+                      />
+                    )}
+                    {hasCash && (
+                      <div
+                        style={{
+                          height: `${cashHpx}px`,
+                          background: CASH,
+                          marginTop: hasCard ? 2 : 0,
+                          opacity: active || hover === null ? 1 : 0.5,
+                        }}
+                        className={hasCard ? "" : "rounded-t-[4px]"}
+                      />
+                    )}
+                  </div>
+
+                  {active && (
+                    <div className="pointer-events-none absolute -top-2 left-1/2 z-10 w-36 -translate-x-1/2 -translate-y-full rounded-lg border border-zinc-700 bg-zinc-950 p-2.5 text-xs shadow-xl">
+                      <p className="font-medium text-zinc-200">{monthLabel(d.month)}</p>
+                      <div className="mt-1.5 space-y-1">
+                        <Row color={CARD} label="Card" value={cad(d.cardFee)} />
+                        <Row color={CASH} label="Cash" value={cad(d.cashFee)} />
+                        <div className="mt-1 flex justify-between border-t border-zinc-800 pt-1 text-zinc-300">
+                          <span>Total</span>
+                          <span className="tabular-nums">{cad(d.totalFee)}</span>
+                        </div>
                       </div>
                     </div>
-                  </div>
-                )}
+                  )}
+                </div>
+              );
+            })}
+          </div>
+
+          {/* baseline — solid, one step brighter than the gridlines */}
+          <div className="border-t border-zinc-700" />
+
+          <div className="mt-1.5 flex gap-1">
+            {data.map((d) => (
+              <div key={d.month} className="flex-1 text-center text-[10px] text-zinc-500">
+                {monthLabel(d.month)}
               </div>
-            );
-          })}
+            ))}
+          </div>
         </div>
       </div>
     </section>
@@ -376,6 +430,28 @@ function InvoiceSection() {
       const res = await updateInvoiceStatus({ id, status });
       if (res.ok) refresh(month);
       else setError(res.error);
+    });
+  };
+
+  const send = (id: string) => {
+    startTransition(async () => {
+      const res = await sendInvoice({ id });
+      if (res.ok) refresh(month);
+      else setError(res.error);
+    });
+  };
+
+  // Generates (or regenerates) the PDF and opens it — works before sending
+  // (preview what will go out) and regardless of whether the company has a
+  // billing email on file (manual-delivery fallback).
+  const [previewingId, setPreviewingId] = useState<string | null>(null);
+  const preview = (id: string) => {
+    setPreviewingId(id);
+    startTransition(async () => {
+      const res = await previewInvoicePdf({ id });
+      if (res.ok) window.open(res.url, "_blank");
+      else setError(res.error);
+      setPreviewingId(null);
     });
   };
 
@@ -465,10 +541,11 @@ function InvoiceSection() {
                 </td>
                 <td className="px-4 py-2.5 text-right">
                   <div className="flex justify-end gap-1.5">
+                    <ActBtn onClick={() => preview(inv.id)} muted>
+                      {previewingId === inv.id ? "…" : "Preview / Download PDF"}
+                    </ActBtn>
                     {inv.status === "draft" && (
-                      <ActBtn onClick={() => setStatus(inv.id, "sent")}>
-                        Mark sent
-                      </ActBtn>
+                      <ActBtn onClick={() => send(inv.id)}>Send invoice</ActBtn>
                     )}
                     {inv.status === "sent" && (
                       <ActBtn onClick={() => setStatus(inv.id, "paid")}>

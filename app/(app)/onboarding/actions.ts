@@ -21,6 +21,8 @@ export async function createCompany(input: {
   baseFare: number;
   ratePerKm: number;
   hstNumber?: string;
+  billingEmail?: string;
+  billingAddress?: string;
   studentDiscountEnabled: boolean;
   studentDiscountPct?: number;
   // Set true to bypass the same-name guard (a genuinely distinct company that
@@ -64,6 +66,8 @@ export async function createCompany(input: {
       base_fare: input.baseFare,
       rate_per_km: input.ratePerKm,
       hst_number: input.hstNumber?.trim() || null,
+      billing_email: input.billingEmail?.trim() || null,
+      billing_address: input.billingAddress?.trim() || null,
       student_discount_enabled: input.studentDiscountEnabled,
       student_discount_pct: input.studentDiscountEnabled
         ? (input.studentDiscountPct ?? 0)
@@ -426,4 +430,120 @@ export async function listCompanies(): Promise<ActionResult<CompanyRow[]>> {
   }));
 
   return { ok: true, data: rows };
+}
+
+// ── Company detail (Companies page edit modal + Onboarding resume) ──
+export type CompanyDetail = CompanyRow & {
+  platformFeePercent: number;
+  baseFare: number;
+  ratePerKm: number;
+  hstNumber: string | null;
+  billingEmail: string | null;
+  billingAddress: string | null;
+};
+
+export async function getCompanyForEdit(
+  companyId: string,
+): Promise<ActionResult<CompanyDetail>> {
+  await requirePlatformOwner();
+  const mgcj = mgcjSupabase();
+
+  const { data: company, error } = await mgcj
+    .from("companies")
+    .select(
+      "id, name, platform_fee_percent, base_fare, rate_per_km, hst_number, billing_email, billing_address, stripe_account_id, stripe_onboarded",
+    )
+    .eq("id", companyId)
+    .maybeSingle();
+  if (error) return { ok: false, error: error.message };
+  if (!company) return { ok: false, error: "Company not found." };
+
+  const [{ data: admin }, { count: inviteCount }] = await Promise.all([
+    mgcj
+      .from("profiles")
+      .select("name")
+      .eq("company_id", companyId)
+      .eq("role", "admin")
+      .limit(1)
+      .maybeSingle(),
+    mgcj
+      .from("driver_invites")
+      .select("id", { count: "exact", head: true })
+      .eq("company_id", companyId),
+  ]);
+
+  return {
+    ok: true,
+    data: {
+      id: company.id,
+      name: company.name,
+      dispatcherName: admin?.name ?? null,
+      inviteCount: inviteCount ?? 0,
+      stripeAccountId: (company.stripe_account_id as string | null) ?? null,
+      stripeOnboarded: !!company.stripe_onboarded,
+      platformFeePercent: Number(company.platform_fee_percent),
+      baseFare: Number(company.base_fare),
+      ratePerKm: Number(company.rate_per_km),
+      hstNumber: company.hst_number,
+      billingEmail: company.billing_email,
+      billingAddress: company.billing_address,
+    },
+  };
+}
+
+export async function updateCompany(input: {
+  companyId: string;
+  name: string;
+  platformFeePercent: number;
+  baseFare: number;
+  ratePerKm: number;
+  hstNumber?: string;
+  billingEmail?: string;
+  billingAddress?: string;
+}): Promise<ActionResult<{ companyId: string }>> {
+  const owner = await requirePlatformOwner();
+
+  const name = input.name.trim();
+  if (!name) return { ok: false, error: "Company name is required." };
+  if (input.platformFeePercent < 0 || input.platformFeePercent > 100)
+    return { ok: false, error: "Platform fee must be between 0 and 100%." };
+  if (input.baseFare < 0 || input.ratePerKm < 0)
+    return { ok: false, error: "Fare values can't be negative." };
+
+  const mgcj = mgcjSupabase();
+
+  const { data: before } = await mgcj
+    .from("companies")
+    .select(
+      "name, platform_fee_percent, base_fare, rate_per_km, hst_number, billing_email, billing_address",
+    )
+    .eq("id", input.companyId)
+    .maybeSingle();
+
+  const after = {
+    name,
+    platform_fee_percent: input.platformFeePercent,
+    base_fare: input.baseFare,
+    rate_per_km: input.ratePerKm,
+    hst_number: input.hstNumber?.trim() || null,
+    billing_email: input.billingEmail?.trim() || null,
+    billing_address: input.billingAddress?.trim() || null,
+  };
+
+  const { error } = await mgcj
+    .from("companies")
+    .update(after)
+    .eq("id", input.companyId);
+  if (error) return { ok: false, error: error.message };
+
+  await writeAudit({
+    actorUserId: owner.id,
+    projectSlug: "mgcj",
+    action: "company.update",
+    target: input.companyId,
+    before,
+    after,
+  });
+
+  return { ok: true, data: { companyId: input.companyId } };
 }

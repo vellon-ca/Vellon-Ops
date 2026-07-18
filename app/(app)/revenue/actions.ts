@@ -4,6 +4,11 @@ import { requirePlatformOwner } from "@/lib/auth/guard";
 import { mgcjSupabase } from "@/lib/connectors/mgcj";
 import { supabaseAdmin } from "@/lib/supabase/admin";
 import { writeAudit } from "@/lib/audit";
+import { getPlatformSettings } from "@/app/(app)/configuration/actions";
+import { buildInvoicePdf } from "@/lib/pdf/invoice";
+import { buildInvoiceEmailHtml } from "@/lib/email/invoiceEmail";
+
+const RESEND_FROM_ADDRESS = "Vellon <billing@vellon.ca>";
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
 
@@ -21,7 +26,7 @@ function missingMigrationMsg(err: {
       err.message,
     );
   return missing
-    ? "Revenue needs two migrations applied: 20260714_ops_revenue.sql in the mgcj SQL editor (then NOTIFY pgrst, 'reload schema') and 0002_invoices.sql in the vellon-ops hub SQL editor."
+    ? "Revenue needs three migrations applied, in order: 20260718_ride_completed_at.sql then 20260714_ops_revenue.sql in the mgcj SQL editor (then NOTIFY pgrst, 'reload schema'), and 0002_invoices.sql in the vellon-ops hub SQL editor."
     : null;
 }
 
@@ -205,6 +210,8 @@ export type Invoice = {
   generated_at: string;
   sent_at: string | null;
   paid_at: string | null;
+  invoice_number: string | null;
+  pdf_path: string | null;
 };
 
 export async function listInvoices(input: {
@@ -268,6 +275,12 @@ export async function generateInvoices(input: {
       .map((i) => i.company_id),
   );
 
+  // Deterministic — same company/month always yields the same number, so
+  // regenerating a draft never reassigns it.
+  const yyyymm = first.slice(0, 4) + first.slice(5, 7);
+  const invoiceNumber = (companyId: string) =>
+    `MGCJ-${yyyymm}-${companyId.slice(0, 6)}`;
+
   const toUpsert = [...perCompany.entries()]
     .filter(([companyId, e]) => e.fares > 0 && !locked.has(companyId))
     .map(([companyId, e]) => ({
@@ -282,6 +295,7 @@ export async function generateInvoices(input: {
       status: "draft",
       generated_by: owner.id,
       generated_at: new Date().toISOString(),
+      invoice_number: invoiceNumber(companyId),
     }));
 
   if (toUpsert.length > 0) {
@@ -324,4 +338,212 @@ export async function updateInvoiceStatus(input: {
     after: { status: input.status },
   });
   return { ok: true };
+}
+
+type BuiltInvoicePdf = {
+  pdfBytes: Uint8Array;
+  pdfPath: string;
+  invoiceNumber: string;
+  companyName: string;
+  periodLabel: string;
+  cashFaresTotal: number;
+  feePercent: number;
+  rideCount: number;
+  amountDue: number;
+  paymentInstructions: string | null;
+  mailingAddress: string | null;
+  billingEmail: string | null;
+};
+
+// Shared by sendInvoice and previewInvoicePdf: builds the PDF from current
+// invoice/company/platform-settings data, uploads it (upsert — regenerating
+// is always safe, drafts can still change up until sent/paid locks them), and
+// stamps pdf_path. Deliberately doesn't require a billing_email — Preview and
+// the manual-delivery path both need to work for companies that don't have
+// one yet.
+async function buildAndStoreInvoicePdf(
+  invoiceId: string,
+): Promise<{ ok: true; data: BuiltInvoicePdf } | { ok: false; error: string }> {
+  const { data: invoice, error: invErr } = await supabaseAdmin
+    .from("invoices")
+    .select(
+      "id, company_id, company_name, period_month, cash_fares_total, fee_percent, ride_count, amount_due, invoice_number",
+    )
+    .eq("id", invoiceId)
+    .maybeSingle();
+  if (invErr) return { ok: false, error: invErr.message };
+  if (!invoice) return { ok: false, error: "Invoice not found." };
+
+  const mgcj = mgcjSupabase();
+  const { data: company, error: companyErr } = await mgcj
+    .from("companies")
+    .select("billing_email, billing_address")
+    .eq("id", invoice.company_id)
+    .maybeSingle();
+  if (companyErr) return { ok: false, error: companyErr.message };
+
+  const settingsRes = await getPlatformSettings();
+  if (!settingsRes.ok) return { ok: false, error: settingsRes.error };
+
+  const periodLabel = new Date(invoice.period_month + "T00:00:00Z").toLocaleDateString(
+    "en-CA",
+    { month: "long", year: "numeric", timeZone: "UTC" },
+  );
+  const issueDate = new Date().toLocaleDateString("en-CA", {
+    month: "long",
+    day: "numeric",
+    year: "numeric",
+    timeZone: "UTC",
+  });
+  const invoiceNumber = invoice.invoice_number ?? `MGCJ-${invoice.id.slice(0, 8).toUpperCase()}`;
+
+  const pdfBytes = await buildInvoicePdf({
+    invoiceNumber,
+    periodLabel,
+    issueDate,
+    companyName: invoice.company_name,
+    billingAddress: company?.billing_address ?? null,
+    cashFaresTotal: Number(invoice.cash_fares_total),
+    feePercent: Number(invoice.fee_percent),
+    rideCount: invoice.ride_count,
+    amountDue: Number(invoice.amount_due),
+    vellon: settingsRes.data,
+  });
+
+  const pdfPath = `mgcj/${invoice.company_id}/${invoice.period_month}.pdf`;
+  const { error: uploadErr } = await supabaseAdmin.storage
+    .from("invoices")
+    .upload(pdfPath, Buffer.from(pdfBytes), {
+      contentType: "application/pdf",
+      upsert: true,
+    });
+  if (uploadErr) return { ok: false, error: uploadErr.message };
+
+  const { error: updateErr } = await supabaseAdmin
+    .from("invoices")
+    .update({ pdf_path: pdfPath })
+    .eq("id", invoiceId);
+  if (updateErr) return { ok: false, error: updateErr.message };
+
+  return {
+    ok: true,
+    data: {
+      pdfBytes,
+      pdfPath,
+      invoiceNumber,
+      companyName: invoice.company_name,
+      periodLabel,
+      cashFaresTotal: Number(invoice.cash_fares_total),
+      feePercent: Number(invoice.fee_percent),
+      rideCount: invoice.ride_count,
+      amountDue: Number(invoice.amount_due),
+      paymentInstructions: settingsRes.data.paymentInstructions,
+      mailingAddress: settingsRes.data.mailingAddress,
+      billingEmail: company?.billing_email ?? null,
+    },
+  };
+}
+
+// Generate/refresh the PDF and return a signed download URL — used for the
+// "Preview / Download PDF" button, before or instead of sending. Same builder
+// sendInvoice uses, just without emailing or touching status.
+export async function previewInvoicePdf(input: {
+  id: string;
+}): Promise<{ ok: true; url: string } | { ok: false; error: string }> {
+  await requirePlatformOwner();
+  const built = await buildAndStoreInvoicePdf(input.id);
+  if (!built.ok) return built;
+  return getInvoicePdfUrl({ pdfPath: built.data.pdfPath });
+}
+
+// Generate the PDF and email it to the company's billing contact, then flip
+// the invoice to sent.
+export async function sendInvoice(input: {
+  id: string;
+}): Promise<{ ok: true } | { ok: false; error: string }> {
+  const owner = await requirePlatformOwner();
+
+  const built = await buildAndStoreInvoicePdf(input.id);
+  if (!built.ok) return built;
+  const {
+    pdfBytes,
+    pdfPath,
+    invoiceNumber,
+    companyName,
+    periodLabel,
+    cashFaresTotal,
+    feePercent,
+    rideCount,
+    amountDue,
+    paymentInstructions,
+    mailingAddress,
+    billingEmail,
+  } = built.data;
+
+  if (!billingEmail) {
+    return {
+      ok: false,
+      error:
+        "Add a billing email for this company first (Companies → Edit) — or use Preview / Download PDF to send it manually.",
+    };
+  }
+
+  const base64Pdf = Buffer.from(pdfBytes).toString("base64");
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      from: RESEND_FROM_ADDRESS,
+      to: billingEmail,
+      subject: `Your Vellon platform fee invoice for ${periodLabel} — $${amountDue.toFixed(2)} due`,
+      html: buildInvoiceEmailHtml({
+        companyName,
+        invoiceNumber,
+        periodLabel,
+        amountDue,
+        cashFaresTotal,
+        feePercent,
+        rideCount,
+        paymentInstructions,
+        mailingAddress,
+      }),
+      attachments: [
+        { filename: `${invoiceNumber}.pdf`, content: base64Pdf, content_type: "application/pdf" },
+      ],
+    }),
+  });
+  if (!res.ok) {
+    const errText = await res.text();
+    return { ok: false, error: `Resend error: ${errText}` };
+  }
+
+  const { error: updateErr } = await supabaseAdmin
+    .from("invoices")
+    .update({ status: "sent", sent_at: new Date().toISOString() })
+    .eq("id", input.id);
+  if (updateErr) return { ok: false, error: updateErr.message };
+
+  await writeAudit({
+    actorUserId: owner.id,
+    projectSlug: "mgcj",
+    action: "invoice.send",
+    target: input.id,
+    after: { billing_email: billingEmail, pdf_path: pdfPath },
+  });
+
+  return { ok: true };
+}
+
+export async function getInvoicePdfUrl(input: {
+  pdfPath: string;
+}): Promise<{ ok: true; url: string } | { ok: false; error: string }> {
+  await requirePlatformOwner();
+  const { data, error } = await supabaseAdmin.storage
+    .from("invoices")
+    .createSignedUrl(input.pdfPath, 60 * 10); // 10 min
+  if (error || !data) return { ok: false, error: error?.message ?? "Could not sign URL." };
+  return { ok: true, url: data.signedUrl };
 }

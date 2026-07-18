@@ -5,9 +5,11 @@ import { usePathname } from "next/navigation";
 
 const NAV = [
   { href: "/overview", label: "Overview" },
+  { href: "/companies", label: "Companies" },
   { href: "/onboarding", label: "Onboarding" },
   { href: "/revenue", label: "Revenue" },
   { href: "/health", label: "DB / Ops health" },
+  { href: "/configuration", label: "Configuration" },
 ];
 
 export function Sidebar({ email }: { email: string | null }) {
@@ -15,11 +17,19 @@ export function Sidebar({ email }: { email: string | null }) {
 
   return (
     <aside className="flex w-60 shrink-0 flex-col border-r border-zinc-800 bg-zinc-900/40">
-      <div className="flex items-center gap-2 px-5 py-5">
-        <div className="h-6 w-6 rounded-md bg-accent" />
-        <span className="text-sm font-semibold tracking-tight text-zinc-100">
-          Vellon Ops
-        </span>
+      <div className="px-5 py-5">
+        <Link href="/projects" className="flex items-center gap-2">
+          <div className="h-6 w-6 rounded-md bg-accent" />
+          <span className="text-sm font-semibold tracking-tight text-zinc-100">
+            Vellon Ops
+          </span>
+        </Link>
+        <Link
+          href="/projects"
+          className="mt-1 block text-xs text-zinc-500 hover:text-zinc-300"
+        >
+          &larr; Projects
+        </Link>
       </div>
 
       <nav className="flex-1 space-y-1 px-3">

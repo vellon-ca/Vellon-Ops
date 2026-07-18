@@ -121,7 +121,7 @@ export function OverviewDashboard() {
           {/* ── Headline tiles ── */}
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
             {/* Companies */}
-            <Link href="/onboarding" className={tile}>
+            <Link href="/companies" className={tile}>
               <p className="text-sm text-zinc-400">Companies</p>
               <p className="mt-2 text-3xl font-semibold text-zinc-100">
                 {ov.companies.total}
@@ -199,7 +199,7 @@ export function OverviewDashboard() {
                     <span className="text-zinc-300">{a.name}</span>
                     <span className="flex items-center gap-3">
                       <span className="text-amber-300/80">{a.issue}</span>
-                      <Link href="/onboarding" className="text-xs text-accent hover:text-accent-hover">
+                      <Link href="/companies" className="text-xs text-accent hover:text-accent-hover">
                         Resume →
                       </Link>
                     </span>
