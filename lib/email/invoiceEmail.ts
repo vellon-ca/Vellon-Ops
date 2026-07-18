@@ -13,6 +13,7 @@ export function buildInvoiceEmailHtml(params: {
   feePercent: number;
   rideCount: number;
   paymentInstructions: string | null;
+  mailingAddress: string | null;
 }): string {
   const {
     companyName,
@@ -23,7 +24,9 @@ export function buildInvoiceEmailHtml(params: {
     feePercent,
     rideCount,
     paymentInstructions,
+    mailingAddress,
   } = params;
+  const year = new Date().getFullYear();
 
   return `
   <div style="font-family: -apple-system, Helvetica, Arial, sans-serif; max-width: 480px; margin: 0 auto; color: #1a1a1a;">
@@ -69,9 +72,16 @@ export function buildInvoiceEmailHtml(params: {
     }
 
     <p style="font-size: 12px; color: #9CA3AF; text-align: center; margin-top: 24px;">
-      Questions about this invoice? Just reply to this email.<br/>
-      Vellon
+      Questions about this invoice? Just reply to this email.
     </p>
+
+    <div style="margin-top: 24px; padding-top: 16px; border-top: 1px solid #E5E7EB; text-align: center;">
+      <p style="margin: 0; font-size: 11px; color: #9CA3AF;">
+        Vellon &middot; <a href="mailto:support@vellon.ca" style="color: #9CA3AF;">support@vellon.ca</a>
+      </p>
+      ${mailingAddress ? `<p style="margin: 4px 0 0; font-size: 11px; color: #9CA3AF;">${mailingAddress}</p>` : ""}
+      <p style="margin: 4px 0 0; font-size: 11px; color: #9CA3AF;">&copy; ${year} Vellon. All rights reserved.</p>
+    </div>
   </div>
   `;
 }

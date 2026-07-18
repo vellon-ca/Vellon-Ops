@@ -351,6 +351,7 @@ type BuiltInvoicePdf = {
   rideCount: number;
   amountDue: number;
   paymentInstructions: string | null;
+  mailingAddress: string | null;
   billingEmail: string | null;
 };
 
@@ -437,6 +438,7 @@ async function buildAndStoreInvoicePdf(
       rideCount: invoice.ride_count,
       amountDue: Number(invoice.amount_due),
       paymentInstructions: settingsRes.data.paymentInstructions,
+      mailingAddress: settingsRes.data.mailingAddress,
       billingEmail: company?.billing_email ?? null,
     },
   };
@@ -474,6 +476,7 @@ export async function sendInvoice(input: {
     rideCount,
     amountDue,
     paymentInstructions,
+    mailingAddress,
     billingEmail,
   } = built.data;
 
@@ -505,6 +508,7 @@ export async function sendInvoice(input: {
         feePercent,
         rideCount,
         paymentInstructions,
+        mailingAddress,
       }),
       attachments: [
         { filename: `${invoiceNumber}.pdf`, content: base64Pdf, content_type: "application/pdf" },
