@@ -280,7 +280,7 @@ export async function generateInvoices(input: {
   // regenerating a draft never reassigns it.
   const yyyymm = first.slice(0, 4) + first.slice(5, 7);
   const invoiceNumber = (companyId: string) =>
-    `MGCJ-${yyyymm}-${companyId.slice(0, 6)}`;
+    `INV-${yyyymm}-${companyId.slice(0, 6)}`;
 
   const toUpsert = [...perCompany.entries()]
     .filter(([companyId, e]) => e.fares > 0 && !locked.has(companyId))
@@ -400,7 +400,7 @@ async function buildAndStoreInvoicePdf(
     year: "numeric",
     timeZone: "UTC",
   });
-  const invoiceNumber = invoice.invoice_number ?? `MGCJ-${invoice.id.slice(0, 8).toUpperCase()}`;
+  const invoiceNumber = invoice.invoice_number ?? `INV-${invoice.id.slice(0, 8).toUpperCase()}`;
 
   const pdfBytes = await buildInvoicePdf({
     invoiceNumber,
