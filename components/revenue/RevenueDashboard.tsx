@@ -8,8 +8,13 @@ import {
   updateInvoiceStatus,
   sendInvoice,
   previewInvoicePdf,
+  syncDisputeCosts,
+  getDisputeCosts,
+  getStrandedSettlements,
   type RevenueSummary,
   type Invoice,
+  type DisputeCosts,
+  type StrandedSettlements,
 } from "@/app/(app)/revenue/actions";
 
 // Dark-mode categorical slots 1 (blue) & 2 (aqua) — validated CVD-safe pair.
@@ -177,10 +182,223 @@ export function RevenueDashboard() {
             </div>
           </section>
 
+          <DisputeSection
+            fromISO={rangeFor(PRESETS[preset].months).fromISO}
+            toISO={rangeFor(PRESETS[preset].months).toISO}
+          />
+
           <InvoiceSection />
         </div>
       )}
     </div>
+  );
+}
+
+// ── Dispute costs ───────────────────────────────────────────────────
+// Vellon's own cost of chargebacks — money that touches no ride's settlement
+// math and is therefore invisible everywhere else on the platform.
+function DisputeSection({ fromISO, toISO }: { fromISO: string; toISO: string }) {
+  const [costs, setCosts] = useState<DisputeCosts | null>(null);
+  const [stranded, setStranded] = useState<StrandedSettlements | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+  const [pending, startTransition] = useTransition();
+
+  const load = useCallback(() => {
+    startTransition(async () => {
+      const [c, s] = await Promise.all([
+        getDisputeCosts({ fromISO, toISO }),
+        getStrandedSettlements(),
+      ]);
+      if (c.ok) setCosts(c.data);
+      else setError(c.error);
+      if (s.ok) setStranded(s.data);
+    });
+  }, [fromISO, toISO]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const sync = () => {
+    startTransition(async () => {
+      const res = await syncDisputeCosts();
+      if (!res.ok) {
+        setError(res.error);
+        return;
+      }
+      setError(null);
+      setNote(
+        `Synced ${res.synced} dispute${res.synced === 1 ? "" : "s"}` +
+          (res.skipped > 0 ? ` · ${res.skipped} already closed and frozen` : ""),
+      );
+      load();
+    });
+  };
+
+  return (
+    <section>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <h2 className="text-sm font-semibold text-zinc-300">Dispute costs</h2>
+          <p className="mt-0.5 text-xs text-zinc-500">
+            Vellon&apos;s own cost of chargebacks — not billed to any company.
+          </p>
+        </div>
+        <button
+          onClick={sync}
+          disabled={pending}
+          className="rounded-md border border-zinc-700 px-3 py-1.5 text-sm text-zinc-300 hover:bg-zinc-800/50 disabled:opacity-50"
+        >
+          {pending ? "…" : "Sync from Stripe"}
+        </button>
+      </div>
+
+      {error && (
+        <p className="mt-3 rounded-md border border-red-900/50 bg-red-950/40 px-3 py-2 text-sm text-red-300">
+          {error}
+        </p>
+      )}
+      {note && !error && (
+        <p className="mt-3 rounded-md border border-zinc-800 bg-zinc-900/40 px-3 py-2 text-sm text-zinc-400">
+          {note}
+        </p>
+      )}
+
+      {costs && (
+        <>
+          <div className="mt-3 grid grid-cols-2 gap-3 lg:grid-cols-4">
+            <Tile
+              label="Net dispute cost"
+              value={"−" + cad(costs.totals.netCost)}
+              sub="this period"
+            />
+            <Tile
+              label="Dispute fees"
+              value={cad(costs.totals.disputeFees)}
+              sub="$15 flat, refunded on a win"
+            />
+            <Tile
+              label="Unrecovered processing"
+              value={cad(costs.totals.processingFees)}
+              sub="Stripe keeps it either way"
+            />
+            <Tile
+              label="Disputes"
+              value={String(costs.totals.count)}
+              sub={
+                costs.totals.openCount > 0
+                  ? `${costs.totals.openCount} still open`
+                  : "all closed"
+              }
+            />
+          </div>
+
+          {costs.totals.openCount > 0 && (
+            <p className="mt-2 text-xs text-zinc-600">
+              Open disputes are counted at their current cost — the money is out
+              of the balance now. Winning one refunds its $15 and drops it to
+              zero on the next sync.
+            </p>
+          )}
+
+          {costs.recent.length > 0 && (
+            <div className="mt-3 overflow-x-auto rounded-xl border border-zinc-800">
+              <table className="w-full min-w-[640px] text-left text-sm">
+                <thead>
+                  <tr className="border-b border-zinc-800 text-xs uppercase tracking-wide text-zinc-500">
+                    <th className="px-4 py-2.5 font-medium">Opened</th>
+                    <th className="px-4 py-2.5 font-medium">Company</th>
+                    <th className="px-4 py-2.5 font-medium">Status</th>
+                    <th className="px-4 py-2.5 text-right font-medium">Fare</th>
+                    <th className="px-4 py-2.5 text-right font-medium">Cost to us</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {costs.recent.map((d) => (
+                    <tr key={d.id} className="border-b border-zinc-900 last:border-0">
+                      <td className="px-4 py-2.5 text-zinc-400">
+                        {new Date(d.openedAt).toLocaleDateString("en-CA")}
+                      </td>
+                      <td className="px-4 py-2.5 text-zinc-200">
+                        {d.companyName ?? (
+                          <span className="text-zinc-600">Unattributed</span>
+                        )}
+                      </td>
+                      <td className="px-4 py-2.5">
+                        <span
+                          className={
+                            "rounded px-1.5 py-0.5 text-xs " +
+                            (d.status === "won"
+                              ? "bg-emerald-950/60 text-emerald-300"
+                              : d.isClosed
+                                ? "bg-red-950/50 text-red-300"
+                                : "bg-amber-950/50 text-amber-300")
+                          }
+                        >
+                          {d.status.replace(/_/g, " ")}
+                        </span>
+                      </td>
+                      <td className="px-4 py-2.5 text-right text-zinc-500">
+                        {cad(d.disputedAmount)}
+                      </td>
+                      <td className="px-4 py-2.5 text-right font-medium text-zinc-100">
+                        {d.netCost === 0 ? "—" : "−" + cad(d.netCost)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {costs.totals.count === 0 && (
+            <p className="mt-3 rounded-xl border border-zinc-800 px-4 py-6 text-center text-sm text-zinc-500">
+              No disputes in this range. Hit &ldquo;Sync from Stripe&rdquo; if
+              you&apos;re expecting some.
+            </p>
+          )}
+        </>
+      )}
+
+      {/* Stranded settlement money. Deliberately outside the period filter —
+          these are outstanding todos, not historical stats. */}
+      {stranded &&
+        (stranded.unrecovered.count > 0 || stranded.owedToDrivers.count > 0) && (
+          <div className="mt-4 rounded-xl border border-zinc-800 p-4">
+            <p className="text-sm font-medium text-zinc-300">
+              Stranded settlement money
+              <span className="ml-2 text-xs font-normal text-zinc-600">
+                outstanding, all time
+              </span>
+            </p>
+            <div className="mt-3 grid gap-3 sm:grid-cols-2">
+              <div>
+                <p className="text-sm text-zinc-400">Unrecovered</p>
+                <p className="mt-1 text-xl font-semibold text-red-300">
+                  −{cad(stranded.unrecovered.amount)}
+                </p>
+                <p className="mt-1 text-xs text-zinc-600">
+                  {stranded.unrecovered.count} ride
+                  {stranded.unrecovered.count === 1 ? "" : "s"} paid out, then
+                  disputed — clawback failed. A real loss.
+                </p>
+              </div>
+              <div>
+                <p className="text-sm text-zinc-400">Owed to drivers</p>
+                <p className="mt-1 text-xl font-semibold text-amber-300">
+                  {cad(stranded.owedToDrivers.amount)}
+                </p>
+                <p className="mt-1 text-xs text-zinc-600">
+                  {stranded.owedToDrivers.count} ride
+                  {stranded.owedToDrivers.count === 1 ? "" : "s"} won on appeal
+                  but the re-send failed. Held, not lost — we still owe it.
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
+    </section>
   );
 }
 

@@ -1,7 +1,7 @@
 "use server";
 
 import { requirePlatformOwner } from "@/lib/auth/guard";
-import { mgcjSupabase } from "@/lib/connectors/mgcj";
+import { mgcjSupabase, stripeGet, stripeConfigured } from "@/lib/connectors/mgcj";
 import { supabaseAdmin } from "@/lib/supabase/admin";
 import { writeAudit } from "@/lib/audit";
 import { getPlatformSettings } from "@/app/(app)/configuration/actions";
@@ -15,18 +15,34 @@ const round2 = (n: number) => Math.round(n * 100) / 100;
 // Turn a "migration not applied yet" PostgREST error into an actionable message
 // (mirrors the graceful degradation in the Health module). Returns null for any
 // other error so real failures aren't masked.
-function missingMigrationMsg(err: {
-  code?: string;
-  message: string;
-}): string | null {
-  const missing =
+function isMissingSchema(err: { code?: string; message: string }): boolean {
+  return (
     err.code === "PGRST202" || // RPC not found
     err.code === "PGRST205" || // table not found in schema cache
     /could not find|does not exist|not find the function|schema cache/i.test(
       err.message,
-    );
-  return missing
+    )
+  );
+}
+
+function missingMigrationMsg(err: {
+  code?: string;
+  message: string;
+}): string | null {
+  return isMissingSchema(err)
     ? "Revenue needs four migrations applied, in order: 20260718_ride_completed_at.sql, 20260714_ops_revenue.sql, then 20260719_ride_fee_percent_snapshot.sql in the mgcj SQL editor (then NOTIFY pgrst, 'reload schema'), and 0002_invoices.sql in the vellon-ops hub SQL editor."
+    : null;
+}
+
+// Dispute costs live in their own table with their own migration — point at
+// that one rather than the Revenue list, which would send you to the wrong
+// SQL editor entirely.
+function missingDisputeMigrationMsg(err: {
+  code?: string;
+  message: string;
+}): string | null {
+  return isMissingSchema(err)
+    ? "Dispute costs need 0006_dispute_costs.sql applied in the vellon-ops hub SQL editor (not the mgcj one)."
     : null;
 }
 
@@ -551,4 +567,359 @@ export async function getInvoicePdfUrl(input: {
     .createSignedUrl(input.pdfPath, 60 * 10); // 10 min
   if (error || !data) return { ok: false, error: error?.message ?? "Could not sign URL." };
   return { ok: true, url: data.signedUrl };
+}
+
+// ── Dispute costs (hub DB, synced from Stripe) ──────────────────────
+// See supabase/migrations/0006_dispute_costs.sql for the full rationale.
+// Short version: a chargeback costs Vellon the $15 dispute fee plus the
+// original processing fee Stripe never gives back — money that touches no
+// ride's settlement math and was previously tracked nowhere.
+
+const cents = (n: number) => round2(n / 100);
+
+type StripeBalanceTxn = { fee?: number };
+type StripeDispute = {
+  id: string;
+  amount: number;
+  currency: string;
+  status: string;
+  reason: string | null;
+  created: number;
+  payment_intent: string | { id: string } | null;
+  charge: string | { id: string; balance_transaction?: string | StripeBalanceTxn } | null;
+  balance_transactions?: StripeBalanceTxn[];
+};
+
+const idOf = (v: string | { id: string } | null | undefined): string | null =>
+  typeof v === "string" ? v : (v?.id ?? null);
+
+// Stripe never reopens a closed dispute, so these are terminal.
+const CLOSED_STATUSES = new Set(["won", "lost", "warning_closed", "charge_refunded"]);
+
+// Pull Vellon's platform-account disputes, attribute them to companies via the
+// mgcj connector, and upsert into the hub. Idempotent — safe to run repeatedly.
+// Disputes already recorded as closed are skipped (frozen), so a re-sync only
+// ever touches still-open ones.
+export async function syncDisputeCosts(): Promise<
+  { ok: true; synced: number; skipped: number } | { ok: false; error: string }
+> {
+  const owner = await requirePlatformOwner();
+  if (!stripeConfigured()) {
+    return { ok: false, error: "Stripe not configured (MGCJ_STRIPE_SECRET missing)." };
+  }
+
+  try {
+    // Which disputes are already frozen — don't re-read or re-write those.
+    const { data: frozenRows, error: frozenErr } = await supabaseAdmin
+      .from("dispute_costs")
+      .select("stripe_dispute_id")
+      .eq("project_slug", "mgcj")
+      .eq("is_closed", true);
+    if (frozenErr) {
+      return { ok: false, error: missingDisputeMigrationMsg(frozenErr) ?? frozenErr.message };
+    }
+    const frozen = new Set((frozenRows ?? []).map((r) => r.stripe_dispute_id));
+
+    // Page through every dispute on the platform account.
+    const disputes: StripeDispute[] = [];
+    let startingAfter: string | null = null;
+    for (let page = 0; page < 50; page++) {
+      const qs = new URLSearchParams({ limit: "100" });
+      qs.append("expand[]", "data.balance_transactions");
+      qs.append("expand[]", "data.charge.balance_transaction");
+      if (startingAfter) qs.set("starting_after", startingAfter);
+
+      const res = await stripeGet(`/disputes?${qs.toString()}`);
+      if (res.error) return { ok: false, error: `Stripe: ${res.error.message}` };
+      disputes.push(...(res.data as StripeDispute[]));
+      if (!res.has_more || res.data.length === 0) break;
+      startingAfter = res.data[res.data.length - 1].id;
+    }
+
+    const pending = disputes.filter((d) => !frozen.has(d.id));
+    if (pending.length === 0) {
+      return { ok: true, synced: 0, skipped: disputes.length };
+    }
+
+    // Attribute to a company: dispute → payment_intent → rides. This path is
+    // used rather than rides.stripe_dispute_id because it doesn't depend on
+    // mgcj's webhook having fired for this dispute.
+    const piIds = pending.map((d) => idOf(d.payment_intent)).filter(Boolean) as string[];
+    const rideByPi = new Map<string, { id: string; company_id: string | null }>();
+    const companyNames = new Map<string, string>();
+
+    if (piIds.length > 0) {
+      const mgcj = mgcjSupabase();
+      const { data: rides, error: ridesErr } = await mgcj
+        .from("rides")
+        .select("id, company_id, stripe_payment_intent_id")
+        .in("stripe_payment_intent_id", piIds);
+      if (ridesErr) return { ok: false, error: `mgcj: ${ridesErr.message}` };
+
+      for (const r of rides ?? []) {
+        rideByPi.set(r.stripe_payment_intent_id, {
+          id: r.id,
+          company_id: r.company_id,
+        });
+      }
+
+      const companyIds = [
+        ...new Set((rides ?? []).map((r) => r.company_id).filter(Boolean)),
+      ] as string[];
+      if (companyIds.length > 0) {
+        const { data: companies } = await mgcj
+          .from("companies")
+          .select("id, name")
+          .in("id", companyIds);
+        for (const c of companies ?? []) companyNames.set(c.id, c.name);
+      }
+    }
+
+    const rows = pending.map((d) => {
+      const piId = idOf(d.payment_intent);
+      const ride = piId ? rideByPi.get(piId) : undefined;
+
+      // Summed rather than hardcoded at $15: a won dispute appends a reversing
+      // adjustment with a negative fee, so the sum collapses to 0 by itself
+      // instead of needing a status branch.
+      const disputeFee = (d.balance_transactions ?? []).reduce(
+        (sum, bt) => sum + (bt.fee ?? 0),
+        0,
+      );
+
+      const chargeBt =
+        typeof d.charge === "object" && typeof d.charge?.balance_transaction === "object"
+          ? d.charge.balance_transaction
+          : null;
+      const processingFee = chargeBt?.fee ?? 0;
+
+      const isWon = d.status === "won";
+      // On a win Vellon keeps the fare, so the processing fee is just the
+      // ordinary cost of a completed ride — already accounted for in that
+      // ride's settlement math, not a dispute cost. Open disputes count it:
+      // the money is out of the balance right now, and lost is the default
+      // outcome if nothing changes.
+      const netCost = disputeFee + (isWon ? 0 : processingFee);
+
+      return {
+        project_slug: "mgcj",
+        stripe_dispute_id: d.id,
+        charge_id: idOf(d.charge),
+        payment_intent_id: piId,
+        company_id: ride?.company_id ?? null,
+        company_name: ride?.company_id
+          ? (companyNames.get(ride.company_id) ?? null)
+          : null,
+        ride_id: ride?.id ?? null,
+        currency: d.currency,
+        disputed_amount_cents: d.amount,
+        dispute_fee_cents: disputeFee,
+        processing_fee_cents: processingFee,
+        net_cost_cents: netCost,
+        status: d.status,
+        reason: d.reason,
+        is_closed: CLOSED_STATUSES.has(d.status),
+        closed_at: CLOSED_STATUSES.has(d.status) ? new Date().toISOString() : null,
+        opened_at: new Date(d.created * 1000).toISOString(),
+        synced_at: new Date().toISOString(),
+      };
+    });
+
+    const { error: upsertErr } = await supabaseAdmin
+      .from("dispute_costs")
+      .upsert(rows, { onConflict: "project_slug,stripe_dispute_id" });
+    if (upsertErr) {
+      return { ok: false, error: missingDisputeMigrationMsg(upsertErr) ?? upsertErr.message };
+    }
+
+    await writeAudit({
+      actorUserId: owner.id,
+      projectSlug: "mgcj",
+      action: "disputes.sync",
+      target: "stripe",
+      after: { synced: rows.length, skipped: disputes.length - rows.length },
+    });
+
+    return { ok: true, synced: rows.length, skipped: disputes.length - rows.length };
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
+  }
+}
+
+export type DisputeCosts = {
+  totals: {
+    count: number;
+    openCount: number;
+    disputeFees: number;
+    processingFees: number;
+    netCost: number;
+  };
+  byCompany: {
+    companyId: string | null;
+    companyName: string;
+    count: number;
+    netCost: number;
+  }[];
+  recent: {
+    id: string;
+    disputeId: string;
+    companyName: string | null;
+    status: string;
+    reason: string | null;
+    disputedAmount: number;
+    netCost: number;
+    openedAt: string;
+    isClosed: boolean;
+  }[];
+};
+
+// Bucketed by opened_at — when the money actually left Vellon's balance.
+export async function getDisputeCosts(input: {
+  fromISO: string;
+  toISO: string;
+}): Promise<{ ok: true; data: DisputeCosts } | { ok: false; error: string }> {
+  await requirePlatformOwner();
+
+  const { data, error } = await supabaseAdmin
+    .from("dispute_costs")
+    .select("*")
+    .eq("project_slug", "mgcj")
+    .gte("opened_at", input.fromISO)
+    .lt("opened_at", input.toISO)
+    .order("opened_at", { ascending: false });
+  if (error)
+    return { ok: false, error: missingDisputeMigrationMsg(error) ?? error.message };
+
+  const rows = data ?? [];
+  const totals = {
+    count: rows.length,
+    openCount: rows.filter((r) => !r.is_closed).length,
+    disputeFees: cents(rows.reduce((s, r) => s + r.dispute_fee_cents, 0)),
+    processingFees: cents(rows.reduce((s, r) => s + r.processing_fee_cents, 0)),
+    netCost: cents(rows.reduce((s, r) => s + r.net_cost_cents, 0)),
+  };
+
+  const byCompany = new Map<string, DisputeCosts["byCompany"][number]>();
+  for (const r of rows) {
+    const key = r.company_id ?? "unattributed";
+    const e =
+      byCompany.get(key) ??
+      {
+        companyId: r.company_id,
+        companyName: r.company_name ?? "Unattributed",
+        count: 0,
+        netCost: 0,
+      };
+    e.count += 1;
+    e.netCost = round2(e.netCost + r.net_cost_cents / 100);
+    byCompany.set(key, e);
+  }
+
+  return {
+    ok: true,
+    data: {
+      totals,
+      byCompany: [...byCompany.values()].sort((a, b) => b.netCost - a.netCost),
+      recent: rows.slice(0, 25).map((r) => ({
+        id: r.id,
+        disputeId: r.stripe_dispute_id,
+        companyName: r.company_name,
+        status: r.status,
+        reason: r.reason,
+        disputedAmount: cents(r.disputed_amount_cents),
+        netCost: cents(r.net_cost_cents),
+        openedAt: r.opened_at,
+        isClosed: r.is_closed,
+      })),
+    },
+  };
+}
+
+// ── Stranded settlements (live from mgcj) ───────────────────────────
+// Two settlement_route states leave money in the wrong place, in OPPOSITE
+// directions — kept apart deliberately, because netting them would hide both:
+//
+//   reversal_failed   — a driver/company was paid, then a dispute pulled the
+//                       fare back off Vellon's balance and the clawback
+//                       failed. Vellon is OUT that money. A real loss.
+//   retransfer_failed — Vellon WON a dispute and owes the driver their share,
+//                       but the re-send failed. Vellon is HOLDING money it
+//                       owes. A liability, not a loss.
+//
+// Deliberately NOT period-scoped, matching the reasoning on mgcj's Needs
+// Attention list: these are outstanding todos, not historical stats. Resolved
+// rows (settlement_resolved_at set by dispatch) drop off.
+export type StrandedSettlements = {
+  unrecovered: { count: number; amount: number }; // reversal_failed — loss
+  owedToDrivers: { count: number; amount: number }; // retransfer_failed — liability
+  byCompany: {
+    companyId: string;
+    companyName: string;
+    unrecovered: number;
+    owedToDrivers: number;
+  }[];
+};
+
+export async function getStrandedSettlements(): Promise<
+  { ok: true; data: StrandedSettlements } | { ok: false; error: string }
+> {
+  await requirePlatformOwner();
+  try {
+    const mgcj = mgcjSupabase();
+    const { data, error } = await mgcj
+      .from("rides")
+      .select("id, company_id, settlement_route, transfer_amount_cents")
+      .in("settlement_route", ["reversal_failed", "retransfer_failed"])
+      .is("settlement_resolved_at", null);
+    if (error) throw new Error(error.message);
+
+    const rows = data ?? [];
+    const companyIds = [...new Set(rows.map((r) => r.company_id).filter(Boolean))];
+    const names = new Map<string, string>();
+    if (companyIds.length > 0) {
+      const { data: companies } = await mgcj
+        .from("companies")
+        .select("id, name")
+        .in("id", companyIds);
+      for (const c of companies ?? []) names.set(c.id, c.name);
+    }
+
+    const out: StrandedSettlements = {
+      unrecovered: { count: 0, amount: 0 },
+      owedToDrivers: { count: 0, amount: 0 },
+      byCompany: [],
+    };
+    const byCompany = new Map<string, StrandedSettlements["byCompany"][number]>();
+
+    for (const r of rows) {
+      // Null when Stripe's real fee was unreadable at capture. Counting it as
+      // zero understates rather than inventing a number — the per-ride Needs
+      // Attention list in mgcj-dashboard is where those get chased down.
+      const amount = (r.transfer_amount_cents ?? 0) / 100;
+      const isLoss = r.settlement_route === "reversal_failed";
+      const bucket = isLoss ? out.unrecovered : out.owedToDrivers;
+      bucket.count += 1;
+      bucket.amount = round2(bucket.amount + amount);
+
+      const key = r.company_id ?? "unattributed";
+      const e =
+        byCompany.get(key) ??
+        {
+          companyId: key,
+          companyName: names.get(key) ?? "Unattributed",
+          unrecovered: 0,
+          owedToDrivers: 0,
+        };
+      if (isLoss) e.unrecovered = round2(e.unrecovered + amount);
+      else e.owedToDrivers = round2(e.owedToDrivers + amount);
+      byCompany.set(key, e);
+    }
+
+    out.byCompany = [...byCompany.values()].sort(
+      (a, b) => b.unrecovered + b.owedToDrivers - (a.unrecovered + a.owedToDrivers),
+    );
+    return { ok: true, data: out };
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
+  }
 }
