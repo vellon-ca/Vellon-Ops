@@ -679,9 +679,8 @@ export async function syncDisputeCosts(): Promise<
       const piId = idOf(d.payment_intent);
       const ride = piId ? rideByPi.get(piId) : undefined;
 
-      // Summed rather than hardcoded at $15: a won dispute appends a reversing
-      // adjustment with a negative fee, so the sum collapses to 0 by itself
-      // instead of needing a status branch.
+      // Summed rather than hardcoded at $15 so an unexpected extra fee line
+      // is picked up rather than silently dropped.
       const disputeFee = (d.balance_transactions ?? []).reduce(
         (sum, bt) => sum + (bt.fee ?? 0),
         0,
@@ -694,12 +693,23 @@ export async function syncDisputeCosts(): Promise<
       const processingFee = chargeBt?.fee ?? 0;
 
       const isWon = d.status === "won";
-      // On a win Vellon keeps the fare, so the processing fee is just the
-      // ordinary cost of a completed ride — already accounted for in that
-      // ride's settlement math, not a dispute cost. Open disputes count it:
-      // the money is out of the balance right now, and lost is the default
-      // outcome if nothing changes.
-      const netCost = disputeFee + (isWon ? 0 : processingFee);
+      // A won dispute's realized cost is zero BY DEFINITION: Stripe refunds
+      // the $15 and returns the fare, and the processing fee is then just the
+      // ordinary cost of a charge that stood — already in that ride's
+      // settlement math, not a dispute cost.
+      //
+      // Hardcoded to 0 rather than trusting disputeFee to have collapsed on
+      // its own. Summing WOULD reach zero once Stripe appends the reversing
+      // -1500 adjustment, but nothing guarantees that balance transaction
+      // lands before the status flips to 'won' — and 'won' also flips
+      // is_closed, which FREEZES the row. Losing that race even once would
+      // permanently record a won dispute at -$15.00 with no re-sync able to
+      // correct it. Unverifiable in test mode (Stripe exposes no way to force
+      // a dispute outcome), so it's made correct by construction instead.
+      //
+      // Open disputes count the full cost: the money is out of the balance
+      // right now, and lost is the outcome if nothing changes.
+      const netCost = isWon ? 0 : disputeFee + processingFee;
 
       return {
         project_slug: "mgcj",
@@ -780,10 +790,15 @@ export async function getDisputeCosts(input: {
 }): Promise<{ ok: true; data: DisputeCosts } | { ok: false; error: string }> {
   await requirePlatformOwner();
 
+  // Currency-scoped: totals below sum cents across rows, which would be
+  // meaningless if a non-CAD dispute ever landed. Filtering rather than
+  // converting keeps the number honest — a USD dispute would go uncounted and
+  // visibly missing, not silently folded in at a 1:1 rate.
   const { data, error } = await supabaseAdmin
     .from("dispute_costs")
     .select("*")
     .eq("project_slug", "mgcj")
+    .eq("currency", "cad")
     .gte("opened_at", input.fromISO)
     .lt("opened_at", input.toISO)
     .order("opened_at", { ascending: false });
