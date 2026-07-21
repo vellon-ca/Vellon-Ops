@@ -276,7 +276,7 @@ function DisputeSection({ fromISO, toISO }: { fromISO: string; toISO: string }) 
             <Tile
               label="Dispute fees"
               value={cad(costs.totals.disputeFees)}
-              sub="$15 flat, refunded on a win"
+              sub="$15 flat, never refunded"
             />
             <Tile
               label="Unrecovered processing"
@@ -296,9 +296,10 @@ function DisputeSection({ fromISO, toISO }: { fromISO: string; toISO: string }) 
 
           {costs.totals.openCount > 0 && (
             <p className="mt-2 text-xs text-zinc-600">
-              Open disputes are counted at their current cost — the money is out
-              of the balance now. Winning one refunds its $15 and drops it to
-              zero on the next sync.
+              Open disputes are counted at their full cost — the money is out
+              of the balance now. Stripe never refunds the $15 dispute fee, win
+              or lose; winning only returns the fare and the $1.26 processing
+              fee, dropping a dispute to $15.00 on the next sync.
             </p>
           )}
 

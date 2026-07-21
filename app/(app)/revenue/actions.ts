@@ -693,23 +693,32 @@ export async function syncDisputeCosts(): Promise<
       const processingFee = chargeBt?.fee ?? 0;
 
       const isWon = d.status === "won";
-      // A won dispute's realized cost is zero BY DEFINITION: Stripe refunds
-      // the $15 and returns the fare, and the processing fee is then just the
-      // ordinary cost of a charge that stood — already in that ride's
-      // settlement math, not a dispute cost.
+      // WINNING A DISPUTE DOES NOT REFUND THE $15. Verified 2026-07-21 by
+      // forcing du_1TvT1p0... to 'won' (evidence[uncategorized_text]=
+      // winning_evidence) and reading the resulting balance transactions:
       //
-      // Hardcoded to 0 rather than trusting disputeFee to have collapsed on
-      // its own. Summing WOULD reach zero once Stripe appends the reversing
-      // -1500 adjustment, but nothing guarantees that balance transaction
-      // lands before the status flips to 'won' — and 'won' also flips
-      // is_closed, which FREEZES the row. Losing that race even once would
-      // permanently record a won dispute at -$15.00 with no re-sync able to
-      // correct it. Unverifiable in test mode (Stripe exposes no way to force
-      // a dispute outcome), so it's made correct by construction instead.
+      //   txn_1TvT1q… adjustment  amount -2594  fee 1500  "Chargeback withdrawal"
+      //   txn_1TvZ7N… adjustment  amount +2594  fee    0  "Chargeback reversal"
       //
-      // Open disputes count the full cost: the money is out of the balance
-      // right now, and lost is the outcome if nothing changes.
-      const netCost = isWon ? 0 : disputeFee + processingFee;
+      // The win returns the FARE and nothing else — the reversal carries
+      // fee 0, and no dispute-fee-refund balance transaction is created
+      // anywhere. Stripe's docs confirm this is policy, not a test-mode gap:
+      // "For businesses outside Mexico, the fee for receiving a dispute is
+      // non-refundable" / "we never return the dispute received fee."
+      // (Only the separate dispute COUNTERED fee comes back on a win, and
+      // this account isn't charged one.)
+      //
+      // So the dispute fee is summed, never zeroed on a win. The sum is also
+      // race-proof: because the reversal's fee is 0, it evaluates to 1500
+      // whether or not that second balance transaction has posted by the time
+      // the status flips to 'won' and freezes the row.
+      //
+      // The PROCESSING fee is the one thing a win does neutralize — the
+      // charge stands, so that $1.26 is just the ordinary cost of a completed
+      // ride, already in the ride's settlement math rather than a dispute
+      // cost. Open disputes count it: the money is out of the balance now,
+      // and lost is the outcome if nothing changes.
+      const netCost = disputeFee + (isWon ? 0 : processingFee);
 
       return {
         project_slug: "mgcj",

@@ -9,11 +9,20 @@
 --     fee_details: [{ description: 'Dispute fee', amount: 1500 }]
 --   charge.balance_transaction       type=charge      amount= 2594  fee= 126
 --
---   -$25.94  fare withdrawn      → nets to zero against the original payment
---   -$15.00  flat dispute fee    → refunded ONLY if Vellon wins
+--   -$25.94  fare withdrawn      → returned only if Vellon wins the dispute
+--   -$15.00  flat dispute fee    → NEVER refunded (see below)
 --   -$ 1.26  original processing → Stripe keeps it either way
 --   ────────
---   -$16.26  real cost of the dispute event
+--   -$16.26  cost of a lost/open dispute;  -$15.00 if won
+--
+-- WINNING DOES NOT REFUND THE $15. Verified by forcing a test dispute to
+-- 'won' and reading the balance transactions: the win posts a "Chargeback
+-- reversal" adjustment returning the fare with fee 0, and no dispute-fee
+-- refund is created anywhere. Stripe's docs confirm it's policy, not a
+-- test-mode gap — "for businesses outside Mexico, the fee for receiving a
+-- dispute is non-refundable". A win only neutralizes the processing fee,
+-- because the charge then stands and that fee becomes the ordinary cost of
+-- a completed ride.
 --
 -- None of that touches rides settlement math — it is not the driver's cost and
 -- not the taxi company's cost. It is pure Vellon cost-of-business, and before
@@ -64,16 +73,16 @@ create table if not exists public.dispute_costs (
   -- The fare itself. Recorded for context only: it nets to zero against the
   -- original payment, so it is deliberately NOT part of net_cost_cents.
   disputed_amount_cents integer not null default 0,
-  -- sum(dispute.balance_transactions[].fee). Summing rather than hardcoding
-  -- $15 means a WON dispute needs no special case: Stripe appends a reversing
-  -- adjustment with a negative fee, so the sum falls to zero on its own.
+  -- sum(dispute.balance_transactions[].fee). Stays 1500 on a win: the
+  -- reversal adjustment carries fee 0, so this is also unaffected by whether
+  -- that second balance transaction has posted yet.
   dispute_fee_cents     integer not null default 0,
   -- The original charge's processing fee, which Stripe keeps win or lose.
   -- Only a COST when the dispute is not won — see net_cost_cents.
   processing_fee_cents  integer not null default 0,
   -- The frozen bottom line: dispute fees + (processing fee, unless won).
-  -- On a win the processing fee is just the ordinary cost of a ride that was
-  -- kept, already accounted for in that ride's settlement math.
+  -- The dispute fee is charged either way; only the processing fee falls off
+  -- on a win, since the charge stands and it becomes ordinary ride cost.
   net_cost_cents        integer not null default 0,
 
   -- Stripe's dispute.status verbatim (warning_needs_response, needs_response,
@@ -105,4 +114,4 @@ create index if not exists dispute_costs_company
 comment on table public.dispute_costs is
   'Vellon-side chargeback costs pulled from Stripe. Open disputes re-sync; closed ones are frozen.';
 comment on column public.dispute_costs.net_cost_cents is
-  'Frozen bottom line in cents: sum of dispute balance-transaction fees, plus the unrecovered processing fee when the dispute was not won. Excludes the disputed fare, which nets out.';
+  'Frozen bottom line in cents: sum of dispute balance-transaction fees (charged win or lose), plus the unrecovered processing fee when the dispute was not won. Excludes the disputed fare.';
