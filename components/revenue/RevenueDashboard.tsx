@@ -11,10 +11,14 @@ import {
   syncDisputeCosts,
   getDisputeCosts,
   getStrandedSettlements,
+  searchRefundableRides,
+  refundRide,
   type RevenueSummary,
   type Invoice,
   type DisputeCosts,
   type StrandedSettlements,
+  type RefundableRide,
+  type RefundReason,
 } from "@/app/(app)/revenue/actions";
 
 // Dark-mode categorical slots 1 (blue) & 2 (aqua) — validated CVD-safe pair.
@@ -128,12 +132,17 @@ export function RevenueDashboard() {
         <div className="mt-6 space-y-8">
           {/* KPI row */}
           <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-            <Tile label="Platform fees" value={cad(rev.totals.fee)} accent />
+            <Tile
+              label="Platform fees"
+              value={cad(rev.totals.fee)}
+              accent
+              sub={rev.totals.refunds > 0 ? `net of ${cad(rev.totals.refunds)} refunded` : undefined}
+            />
             <Tile
               label="Card fees"
               value={cad(rev.totals.cardFee)}
               dot={CARD}
-              sub="auto-collected"
+              sub={rev.totals.refunds > 0 ? "auto-collected, net of refunds" : "auto-collected"}
             />
             <Tile
               label="Cash fees"
@@ -186,6 +195,8 @@ export function RevenueDashboard() {
             fromISO={rangeFor(PRESETS[preset].months).fromISO}
             toISO={rangeFor(PRESETS[preset].months).toISO}
           />
+
+          <RefundSection />
 
           <InvoiceSection />
         </div>
@@ -365,7 +376,9 @@ function DisputeSection({ fromISO, toISO }: { fromISO: string; toISO: string }) 
       {/* Stranded settlement money. Deliberately outside the period filter —
           these are outstanding todos, not historical stats. */}
       {stranded &&
-        (stranded.unrecovered.count > 0 || stranded.owedToDrivers.count > 0) && (
+        (stranded.unrecovered.count > 0 ||
+          stranded.owedToDrivers.count > 0 ||
+          stranded.refundReview.count > 0) && (
           <div className="mt-4 rounded-xl border border-zinc-800 p-4">
             <p className="text-sm font-medium text-zinc-300">
               Stranded settlement money
@@ -373,7 +386,7 @@ function DisputeSection({ fromISO, toISO }: { fromISO: string; toISO: string }) 
                 outstanding, all time
               </span>
             </p>
-            <div className="mt-3 grid gap-3 sm:grid-cols-2">
+            <div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
               <div>
                 <p className="text-sm text-zinc-400">Unrecovered</p>
                 <p className="mt-1 text-xl font-semibold text-red-300">
@@ -396,6 +409,20 @@ function DisputeSection({ fromISO, toISO }: { fromISO: string; toISO: string }) 
                   but the re-send failed. Held, not lost — we still owe it.
                 </p>
               </div>
+              {stranded.refundReview.count > 0 && (
+                <div>
+                  <p className="text-sm text-zinc-400">Refunds to review</p>
+                  <p className="mt-1 text-xl font-semibold text-amber-300">
+                    {cad(stranded.refundReview.amount)}
+                  </p>
+                  <p className="mt-1 text-xs text-zinc-600">
+                    {stranded.refundReview.count} ride
+                    {stranded.refundReview.count === 1 ? "" : "s"} refunded outside
+                    the Refunds flow — decide who absorbs it and claw back manually
+                    in Stripe.
+                  </p>
+                </div>
+              )}
             </div>
           </div>
         )}
@@ -826,5 +853,327 @@ function ActBtn({
     >
       {children}
     </button>
+  );
+}
+
+// ── Refunds ─────────────────────────────────────────────────────────
+// Look up a passenger's completed card rides and issue a refund after
+// investigating a complaint. The reason chosen in the modal decides who
+// absorbs it (driver/company vs Vellon); the driver clawback, if any, runs a
+// moment later via mgcj's stripe-webhook. See refundRide in actions.ts.
+const REASON_OPTIONS: {
+  value: RefundReason;
+  label: string;
+  blurb: string;
+}[] = [
+  {
+    value: "driver_fault",
+    label: "Driver / company at fault",
+    blurb: "Clawed back from the driver's payout, driver-first. Vellon keeps its fee.",
+  },
+  {
+    value: "platform_mistake",
+    label: "Platform mistake",
+    blurb: "Vellon absorbs it — the driver keeps their payout.",
+  },
+  {
+    value: "goodwill",
+    label: "Goodwill gesture",
+    blurb: "Vellon absorbs it — the driver keeps their payout.",
+  },
+];
+
+function fmtDate(iso: string | null) {
+  if (!iso) return "—";
+  return new Date(iso).toLocaleDateString("en-CA", {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  });
+}
+
+function RefundSection() {
+  const [phone, setPhone] = useState("");
+  const [rides, setRides] = useState<RefundableRide[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+  const [active, setActive] = useState<RefundableRide | null>(null); // ride being refunded
+  const [pending, startTransition] = useTransition();
+
+  const search = useCallback(() => {
+    setError(null);
+    setNote(null);
+    startTransition(async () => {
+      const res = await searchRefundableRides({ phone });
+      if (res.ok) setRides(res.data);
+      else setError(res.error);
+    });
+  }, [phone]);
+
+  return (
+    <section>
+      <h2 className="text-sm font-semibold text-zinc-300">Refunds</h2>
+      <p className="mt-1 text-xs text-zinc-500">
+        Look up a passenger&apos;s completed card rides by phone and issue a
+        refund. Cash rides aren&apos;t refundable here — they&apos;re invoiced
+        monthly.
+      </p>
+
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        <input
+          value={phone}
+          onChange={(e) => setPhone(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && search()}
+          placeholder="Passenger phone (e.g. 902 555 0134)"
+          className="w-64 rounded-md border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-200 placeholder:text-zinc-600 focus:border-zinc-500 focus:outline-none"
+        />
+        <button
+          onClick={search}
+          disabled={pending}
+          className="rounded-md border border-zinc-700 px-3 py-1.5 text-sm text-zinc-300 hover:bg-zinc-800/50 disabled:opacity-50"
+        >
+          {pending ? "…" : "Search"}
+        </button>
+      </div>
+
+      {error && (
+        <p className="mt-3 rounded-md border border-red-900/50 bg-red-950/40 px-3 py-2 text-sm text-red-300">
+          {error}
+        </p>
+      )}
+      {note && (
+        <p className="mt-3 rounded-md border border-emerald-900/50 bg-emerald-950/40 px-3 py-2 text-sm text-emerald-300">
+          {note}
+        </p>
+      )}
+
+      {rides && rides.length === 0 && (
+        <p className="mt-3 text-sm text-zinc-500">
+          No completed card rides for that number.
+        </p>
+      )}
+
+      {rides && rides.length > 0 && (
+        <div className="mt-3 overflow-x-auto rounded-xl border border-zinc-800">
+          <table className="w-full min-w-[720px] text-left text-sm">
+            <thead>
+              <tr className="border-b border-zinc-800 text-xs uppercase tracking-wide text-zinc-500">
+                <th className="px-4 py-2.5 font-medium">Date</th>
+                <th className="px-4 py-2.5 font-medium">Company</th>
+                <th className="px-4 py-2.5 font-medium">Driver</th>
+                <th className="px-4 py-2.5 text-right font-medium">Fare</th>
+                <th className="px-4 py-2.5 text-right font-medium">Refunded</th>
+                <th className="px-4 py-2.5 text-right font-medium"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {rides.map((r) => (
+                <tr key={r.id} className="border-b border-zinc-900 last:border-0">
+                  <td className="px-4 py-2.5 text-zinc-300">{fmtDate(r.completedAt)}</td>
+                  <td className="px-4 py-2.5 text-zinc-300">{r.companyName}</td>
+                  <td className="px-4 py-2.5 text-zinc-400">{r.driverName ?? "—"}</td>
+                  <td className="px-4 py-2.5 text-right text-zinc-200">
+                    {r.fareFinal != null ? cad(r.fareFinal) : "—"}
+                  </td>
+                  <td className="px-4 py-2.5 text-right text-zinc-400">
+                    {r.refundedCents > 0 ? cad(r.refundedCents / 100) : "—"}
+                  </td>
+                  <td className="px-4 py-2.5 text-right">
+                    {r.refundable ? (
+                      <button
+                        onClick={() => setActive(r)}
+                        className="rounded-md border border-amber-800/60 px-2.5 py-1 text-xs text-amber-300 hover:bg-amber-950/40"
+                      >
+                        Refund
+                      </button>
+                    ) : (
+                      <span className="text-xs text-zinc-600" title={r.blockedReason ?? ""}>
+                        {r.blockedReason ?? "—"}
+                      </span>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {active && (
+        <RefundModal
+          ride={active}
+          onClose={() => setActive(null)}
+          onDone={(msg) => {
+            setActive(null);
+            setNote(msg);
+            search(); // refresh so the row reflects the new refunded total
+          }}
+        />
+      )}
+    </section>
+  );
+}
+
+function RefundModal({
+  ride,
+  onClose,
+  onDone,
+}: {
+  ride: RefundableRide;
+  onClose: () => void;
+  onDone: (message: string) => void;
+}) {
+  const remainingCents = (ride.chargedCents ?? 0) - ride.refundedCents;
+  const [mode, setMode] = useState<"full" | "partial">("full");
+  const [dollars, setDollars] = useState("");
+  const [reason, setReason] = useState<RefundReason | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [pending, startTransition] = useTransition();
+
+  const partialCents =
+    mode === "partial" ? Math.round(parseFloat(dollars || "0") * 100) : remainingCents;
+  const amountCents = mode === "full" ? remainingCents : partialCents;
+  const amountValid = amountCents > 0 && amountCents <= remainingCents;
+
+  const submit = () => {
+    if (!reason) {
+      setError("Pick a reason.");
+      return;
+    }
+    if (!amountValid) {
+      setError(`Enter an amount between $0.01 and ${cad(remainingCents / 100)}.`);
+      return;
+    }
+    setError(null);
+    startTransition(async () => {
+      const res = await refundRide({
+        rideId: ride.id,
+        amountCents: mode === "full" ? undefined : amountCents,
+        reason,
+      });
+      if (!res.ok) {
+        setError(res.error);
+        return;
+      }
+      onDone(
+        `Refunded ${cad(res.amountCents / 100)}` +
+          (res.clawback
+            ? " — the driver/company clawback will complete via Stripe shortly."
+            : " — absorbed by Vellon."),
+      );
+    });
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-md rounded-xl border border-zinc-800 bg-zinc-950 p-5"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h3 className="text-base font-semibold text-zinc-100">Refund ride</h3>
+        <p className="mt-1 text-xs text-zinc-500">
+          {ride.companyName} · {ride.passengerName ?? ride.passengerPhone ?? "passenger"} ·{" "}
+          {fmtDate(ride.completedAt)}
+        </p>
+        <p className="mt-2 text-sm text-zinc-400">
+          Fare {ride.fareFinal != null ? cad(ride.fareFinal) : "—"}
+          {ride.refundedCents > 0 && (
+            <> · already refunded {cad(ride.refundedCents / 100)}</>
+          )}
+          <> · up to {cad(remainingCents / 100)} refundable</>
+        </p>
+
+        {/* Amount */}
+        <div className="mt-4">
+          <p className="text-xs font-medium uppercase tracking-wide text-zinc-500">Amount</p>
+          <div className="mt-2 flex gap-2">
+            <button
+              onClick={() => setMode("full")}
+              className={
+                "rounded-md border px-3 py-1.5 text-sm " +
+                (mode === "full"
+                  ? "border-zinc-500 bg-zinc-800 text-zinc-100"
+                  : "border-zinc-800 text-zinc-400 hover:bg-zinc-800/40")
+              }
+            >
+              Full ({cad(remainingCents / 100)})
+            </button>
+            <button
+              onClick={() => setMode("partial")}
+              className={
+                "rounded-md border px-3 py-1.5 text-sm " +
+                (mode === "partial"
+                  ? "border-zinc-500 bg-zinc-800 text-zinc-100"
+                  : "border-zinc-800 text-zinc-400 hover:bg-zinc-800/40")
+              }
+            >
+              Partial
+            </button>
+            {mode === "partial" && (
+              <div className="relative flex-1">
+                <span className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-sm text-zinc-500">
+                  $
+                </span>
+                <input
+                  autoFocus
+                  value={dollars}
+                  onChange={(e) => setDollars(e.target.value)}
+                  placeholder="0.00"
+                  inputMode="decimal"
+                  className="w-full rounded-md border border-zinc-700 bg-zinc-900 py-1.5 pl-6 pr-2 text-sm text-zinc-200 focus:border-zinc-500 focus:outline-none"
+                />
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Reason */}
+        <div className="mt-4">
+          <p className="text-xs font-medium uppercase tracking-wide text-zinc-500">Reason</p>
+          <div className="mt-2 space-y-1.5">
+            {REASON_OPTIONS.map((o) => (
+              <button
+                key={o.value}
+                onClick={() => setReason(o.value)}
+                className={
+                  "flex w-full flex-col items-start rounded-md border px-3 py-2 text-left " +
+                  (reason === o.value
+                    ? "border-zinc-500 bg-zinc-800/60"
+                    : "border-zinc-800 hover:bg-zinc-800/30")
+                }
+              >
+                <span className="text-sm text-zinc-200">{o.label}</span>
+                <span className="text-xs text-zinc-500">{o.blurb}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {error && (
+          <p className="mt-3 rounded-md border border-red-900/50 bg-red-950/40 px-3 py-2 text-sm text-red-300">
+            {error}
+          </p>
+        )}
+
+        <div className="mt-5 flex justify-end gap-2">
+          <button
+            onClick={onClose}
+            className="rounded-md border border-zinc-700 px-3 py-1.5 text-sm text-zinc-300 hover:bg-zinc-800/50"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={submit}
+            disabled={pending || !reason || !amountValid}
+            className="rounded-md border border-amber-700 bg-amber-900/30 px-3 py-1.5 text-sm text-amber-200 hover:bg-amber-900/50 disabled:opacity-50"
+          >
+            {pending ? "Refunding…" : `Refund ${amountValid ? cad(amountCents / 100) : ""}`}
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }

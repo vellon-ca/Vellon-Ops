@@ -24,6 +24,7 @@ export function mgcjSupabase() {
 export async function stripePost(
   path: string,
   body: Record<string, string> = {},
+  idempotencyKey?: string,
 ) {
   const key = process.env.MGCJ_STRIPE_SECRET;
   if (!key) throw new Error("Stripe not configured (MGCJ_STRIPE_SECRET missing)");
@@ -33,12 +34,15 @@ export async function stripePost(
       "MGCJ_STRIPE_SECRET must be a secret key (sk_...), not a publishable key.",
     );
   }
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${key}`,
+    "Content-Type": "application/x-www-form-urlencoded",
+  };
+  // Lets a double-submitted refund reach Stripe as the SAME refund, not two.
+  if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
   const res = await fetch(`https://api.stripe.com/v1${path}`, {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${key}`,
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
+    headers,
     body: new URLSearchParams(body).toString(),
   });
   return res.json();

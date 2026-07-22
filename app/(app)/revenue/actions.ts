@@ -1,7 +1,7 @@
 "use server";
 
 import { requirePlatformOwner } from "@/lib/auth/guard";
-import { mgcjSupabase, stripeGet, stripeConfigured } from "@/lib/connectors/mgcj";
+import { mgcjSupabase, stripeGet, stripePost, stripeConfigured } from "@/lib/connectors/mgcj";
 import { supabaseAdmin } from "@/lib/supabase/admin";
 import { writeAudit } from "@/lib/audit";
 import { getPlatformSettings } from "@/app/(app)/configuration/actions";
@@ -56,6 +56,7 @@ type RevRow = {
   ride_count: number;
   fares_total: number;
   fee_total: number;
+  refund_total: number; // Vellon's realized loss from refunds (card-only)
 };
 
 export type RevenueSummary = {
@@ -63,9 +64,10 @@ export type RevenueSummary = {
   to: string;
   totals: {
     fares: number;
-    fee: number;
-    cardFee: number;
+    fee: number; // NET of refunds
+    cardFee: number; // NET of refunds (refunds are card-only)
     cashFee: number;
+    refunds: number; // realized refund loss, netted out of fee/cardFee above
     rides: number;
   };
   byCompany: {
@@ -93,6 +95,7 @@ async function fetchRevRows(fromISO: string, toISO: string): Promise<RevRow[]> {
     ride_count: Number(r.ride_count),
     fares_total: Number(r.fares_total),
     fee_total: Number(r.fee_total),
+    refund_total: Number(r.refund_total ?? 0),
   }));
 }
 
@@ -133,17 +136,22 @@ export async function getRevenue(input: {
   try {
     const rows = await fetchRevRows(input.fromISO, input.toISO);
 
-    const totals = { fares: 0, fee: 0, cardFee: 0, cashFee: 0, rides: 0 };
+    const totals = { fares: 0, fee: 0, cardFee: 0, cashFee: 0, refunds: 0, rides: 0 };
     const companies = new Map<string, RevenueSummary["byCompany"][number]>();
     const months = new Map<string, RevenueSummary["byMonth"][number]>();
 
     for (const r of rows) {
       const isCard = r.payment_method === "card";
+      // Net Vellon's realized refund loss out of the fee. Refunds are card-only
+      // (refund_total is 0 on cash rows), so this only ever reduces card fees —
+      // cardFee + cashFee still equals totalFee.
+      const netFee = r.fee_total - r.refund_total;
       totals.fares += r.fares_total;
-      totals.fee += r.fee_total;
+      totals.fee += netFee;
+      totals.refunds += r.refund_total;
       totals.rides += r.ride_count;
-      if (isCard) totals.cardFee += r.fee_total;
-      else totals.cashFee += r.fee_total;
+      if (isCard) totals.cardFee += netFee;
+      else totals.cashFee += netFee;
 
       const c =
         companies.get(r.company_id) ??
@@ -156,19 +164,19 @@ export async function getRevenue(input: {
           rides: 0,
           fares: 0,
         };
-      c.totalFee += r.fee_total;
+      c.totalFee += netFee;
       c.rides += r.ride_count;
       c.fares += r.fares_total;
-      if (isCard) c.cardFee += r.fee_total;
-      else c.cashFee += r.fee_total;
+      if (isCard) c.cardFee += netFee;
+      else c.cashFee += netFee;
       companies.set(r.company_id, c);
 
       const mo =
         months.get(r.month) ??
         { month: r.month, cardFee: 0, cashFee: 0, totalFee: 0 };
-      mo.totalFee += r.fee_total;
-      if (isCard) mo.cardFee += r.fee_total;
-      else mo.cashFee += r.fee_total;
+      mo.totalFee += netFee;
+      if (isCard) mo.cardFee += netFee;
+      else mo.cashFee += netFee;
       months.set(r.month, mo);
     }
 
@@ -183,6 +191,7 @@ export async function getRevenue(input: {
           fee: fix(totals.fee),
           cardFee: fix(totals.cardFee),
           cashFee: fix(totals.cashFee),
+          refunds: fix(totals.refunds),
           rides: totals.rides,
         },
         byCompany: [...companies.values()]
@@ -869,6 +878,10 @@ export async function getDisputeCosts(input: {
 //   retransfer_failed — Vellon WON a dispute and owes the driver their share,
 //                       but the re-send failed. Vellon is HOLDING money it
 //                       owes. A liability, not a loss.
+//   refund_review     — a refund was issued STRAIGHT IN STRIPE (bypassing the
+//                       Refunds flow), so the webhook had no reason metadata and
+//                       wouldn't guess a driver's fault. Needs Victor to decide
+//                       and manually claw back (or absorb) the driver's payout.
 //
 // Deliberately NOT period-scoped, matching the reasoning on mgcj's Needs
 // Attention list: these are outstanding todos, not historical stats. Resolved
@@ -876,11 +889,13 @@ export async function getDisputeCosts(input: {
 export type StrandedSettlements = {
   unrecovered: { count: number; amount: number }; // reversal_failed — loss
   owedToDrivers: { count: number; amount: number }; // retransfer_failed — liability
+  refundReview: { count: number; amount: number }; // refund_review — needs a decision
   byCompany: {
     companyId: string;
     companyName: string;
     unrecovered: number;
     owedToDrivers: number;
+    refundReview: number;
   }[];
 };
 
@@ -892,8 +907,8 @@ export async function getStrandedSettlements(): Promise<
     const mgcj = mgcjSupabase();
     const { data, error } = await mgcj
       .from("rides")
-      .select("id, company_id, settlement_route, transfer_amount_cents")
-      .in("settlement_route", ["reversal_failed", "retransfer_failed"])
+      .select("id, company_id, settlement_route, transfer_amount_cents, refunded_amount_cents")
+      .in("settlement_route", ["reversal_failed", "retransfer_failed", "refund_review"])
       .is("settlement_resolved_at", null);
     if (error) throw new Error(error.message);
 
@@ -911,17 +926,29 @@ export async function getStrandedSettlements(): Promise<
     const out: StrandedSettlements = {
       unrecovered: { count: 0, amount: 0 },
       owedToDrivers: { count: 0, amount: 0 },
+      refundReview: { count: 0, amount: 0 },
       byCompany: [],
     };
     const byCompany = new Map<string, StrandedSettlements["byCompany"][number]>();
 
     for (const r of rows) {
-      // Null when Stripe's real fee was unreadable at capture. Counting it as
-      // zero understates rather than inventing a number — the per-ride Needs
-      // Attention list in mgcj-dashboard is where those get chased down.
-      const amount = (r.transfer_amount_cents ?? 0) / 100;
-      const isLoss = r.settlement_route === "reversal_failed";
-      const bucket = isLoss ? out.unrecovered : out.owedToDrivers;
+      const route = r.settlement_route;
+      // For refund_review the money under review is the driver's payout capped at
+      // the refund; for the two failed routes it's the whole transfer. Null
+      // transfer_amount_cents (Stripe fee unreadable at capture) counts as zero —
+      // understates rather than inventing a number.
+      const transfer = (r.transfer_amount_cents ?? 0) / 100;
+      const amount =
+        route === "refund_review"
+          ? Math.min(transfer, (r.refunded_amount_cents ?? 0) / 100)
+          : transfer;
+
+      const bucket =
+        route === "reversal_failed"
+          ? out.unrecovered
+          : route === "retransfer_failed"
+            ? out.owedToDrivers
+            : out.refundReview;
       bucket.count += 1;
       bucket.amount = round2(bucket.amount + amount);
 
@@ -933,16 +960,263 @@ export async function getStrandedSettlements(): Promise<
           companyName: names.get(key) ?? "Unattributed",
           unrecovered: 0,
           owedToDrivers: 0,
+          refundReview: 0,
         };
-      if (isLoss) e.unrecovered = round2(e.unrecovered + amount);
-      else e.owedToDrivers = round2(e.owedToDrivers + amount);
+      if (route === "reversal_failed") e.unrecovered = round2(e.unrecovered + amount);
+      else if (route === "retransfer_failed") e.owedToDrivers = round2(e.owedToDrivers + amount);
+      else e.refundReview = round2(e.refundReview + amount);
       byCompany.set(key, e);
     }
 
     out.byCompany = [...byCompany.values()].sort(
-      (a, b) => b.unrecovered + b.owedToDrivers - (a.unrecovered + a.owedToDrivers),
+      (a, b) =>
+        b.unrecovered + b.owedToDrivers + b.refundReview -
+        (a.unrecovered + a.owedToDrivers + a.refundReview),
     );
     return { ok: true, data: out };
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
+  }
+}
+
+// ── Refunds ──────────────────────────────────────────────────────────
+// Vellon-issued refunds against a completed CARD ride, after Victor
+// investigates a passenger complaint (there is no self-serve refund anywhere
+// in the app/dashboard — this is the only refund surface). The REASON picks who
+// absorbs the money:
+//
+//   driver_fault     -> the driver/company's transfer is clawed back, DRIVER-FIRST
+//   platform_mistake -> Vellon absorbs it (no clawback)
+//   goodwill         -> Vellon absorbs it (no clawback)
+//
+// This action only ISSUES the Stripe refund and stamps the decision as refund
+// metadata. The transfer clawback itself is done by mgcj's stripe-webhook
+// `charge.refunded` handler — the single place transfer reversals happen, same
+// as disputes — which reads that metadata so it never races this write. So a
+// driver_fault clawback completes a moment later via the webhook, not inline.
+// See mgcj-app migration 20260729_ride_refund_fields.sql.
+
+export type RefundReason = "driver_fault" | "platform_mistake" | "goodwill";
+
+const REFUND_ABSORBED_BY: Record<RefundReason, "driver_company" | "vellon"> = {
+  driver_fault: "driver_company",
+  platform_mistake: "vellon",
+  goodwill: "vellon",
+};
+
+export type RefundableRide = {
+  id: string;
+  companyName: string;
+  driverName: string | null;
+  passengerName: string | null;
+  passengerPhone: string | null;
+  completedAt: string | null;
+  fareFinal: number | null; // dollars
+  chargedCents: number | null; // fare in cents — the refund ceiling
+  refundedCents: number; // already refunded
+  settlementRoute: string | null;
+  refundable: boolean; // passes every guard below
+  blockedReason: string | null; // why not, if refundable === false
+};
+
+// Find a passenger's completed card rides by phone, newest first, annotated with
+// whether each can still be refunded. Phone match is a loose suffix contains —
+// operators paste whatever format the passenger gave them.
+export async function searchRefundableRides(input: {
+  phone: string;
+}): Promise<{ ok: true; data: RefundableRide[] } | { ok: false; error: string }> {
+  await requirePlatformOwner();
+  try {
+    if (!stripeConfigured()) {
+      return { ok: false, error: "Stripe is not configured (MGCJ_STRIPE_SECRET)." };
+    }
+    const digits = input.phone.replace(/[^0-9]/g, "");
+    if (digits.length < 4) {
+      return { ok: false, error: "Enter at least 4 digits of the passenger's phone." };
+    }
+
+    const mgcj = mgcjSupabase();
+
+    // Passengers whose phone contains the entered digits.
+    const { data: passengers, error: pErr } = await mgcj
+      .from("profiles")
+      .select("id, name, phone")
+      .ilike("phone", `%${digits}%`)
+      .limit(25);
+    if (pErr) throw new Error(pErr.message);
+    if (!passengers || passengers.length === 0) return { ok: true, data: [] };
+
+    const passengerById = new Map(passengers.map((p) => [p.id, p]));
+
+    const { data: rides, error: rErr } = await mgcj
+      .from("rides")
+      .select(
+        "id, company_id, driver_id, passenger_id, completed_at, fare_final, payment_method, payment_status, stripe_payment_intent_id, stripe_dispute_id, refunded_amount_cents, settlement_route",
+      )
+      .in("passenger_id", [...passengerById.keys()])
+      .eq("payment_method", "card")
+      .eq("status", "completed")
+      .order("completed_at", { ascending: false })
+      .limit(50);
+    if (rErr) throw new Error(rErr.message);
+    if (!rides || rides.length === 0) return { ok: true, data: [] };
+
+    // Resolve company + driver display names in bulk.
+    const companyIds = [...new Set(rides.map((r) => r.company_id).filter(Boolean))];
+    const driverIds = [...new Set(rides.map((r) => r.driver_id).filter(Boolean))];
+    const companyNames = new Map<string, string>();
+    const driverNames = new Map<string, string>();
+    if (companyIds.length) {
+      const { data } = await mgcj.from("companies").select("id, name").in("id", companyIds);
+      for (const c of data ?? []) companyNames.set(c.id, c.name);
+    }
+    if (driverIds.length) {
+      const { data } = await mgcj.from("profiles").select("id, name").in("id", driverIds);
+      for (const d of data ?? []) driverNames.set(d.id, d.name);
+    }
+
+    const out: RefundableRide[] = rides.map((r) => {
+      const passenger = passengerById.get(r.passenger_id);
+      const chargedCents = r.fare_final != null ? Math.round(r.fare_final * 100) : null;
+      const refundedCents = r.refunded_amount_cents ?? 0;
+
+      let blockedReason: string | null = null;
+      if (r.stripe_dispute_id) blockedReason = "Charge is disputed — resolve the dispute, don't refund.";
+      else if (!r.stripe_payment_intent_id) blockedReason = "No payment intent on this ride.";
+      else if (r.payment_status !== "succeeded") {
+        blockedReason =
+          r.payment_status === "refunded"
+            ? "Already fully refunded."
+            : `Payment not captured (status: ${r.payment_status ?? "unknown"}).`;
+      } else if (chargedCents == null) blockedReason = "No final fare recorded.";
+      else if (refundedCents >= chargedCents) blockedReason = "Already fully refunded.";
+
+      return {
+        id: r.id,
+        companyName: companyNames.get(r.company_id) ?? "Unknown company",
+        driverName: r.driver_id ? driverNames.get(r.driver_id) ?? null : null,
+        passengerName: passenger?.name ?? null,
+        passengerPhone: passenger?.phone ?? null,
+        completedAt: r.completed_at,
+        fareFinal: r.fare_final,
+        chargedCents,
+        refundedCents,
+        settlementRoute: r.settlement_route,
+        refundable: blockedReason === null,
+        blockedReason,
+      };
+    });
+
+    return { ok: true, data: out };
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
+  }
+}
+
+export async function refundRide(input: {
+  rideId: string;
+  amountCents?: number; // omit for a full refund of the remaining balance
+  reason: RefundReason;
+}): Promise<
+  | { ok: true; refundId: string; amountCents: number; clawback: boolean }
+  | { ok: false; error: string }
+> {
+  const owner = await requirePlatformOwner();
+  try {
+    if (!stripeConfigured()) {
+      return { ok: false, error: "Stripe is not configured (MGCJ_STRIPE_SECRET)." };
+    }
+    const absorbedBy = REFUND_ABSORBED_BY[input.reason];
+    if (!absorbedBy) return { ok: false, error: "Unknown refund reason." };
+
+    const mgcj = mgcjSupabase();
+    const { data: ride, error: rErr } = await mgcj
+      .from("rides")
+      .select(
+        "id, company_id, payment_method, payment_status, stripe_payment_intent_id, stripe_dispute_id, fare_final, refunded_amount_cents",
+      )
+      .eq("id", input.rideId)
+      .maybeSingle();
+    if (rErr) throw new Error(rErr.message);
+    if (!ride) return { ok: false, error: "Ride not found." };
+
+    // Guards — mirror searchRefundableRides so a stale UI can't push a bad refund.
+    if (ride.payment_method !== "card") return { ok: false, error: "Not a card ride." };
+    if (ride.stripe_dispute_id)
+      return { ok: false, error: "Charge is disputed — resolve the dispute instead of refunding." };
+    if (!ride.stripe_payment_intent_id)
+      return { ok: false, error: "No payment intent on this ride." };
+    if (ride.payment_status !== "succeeded")
+      return { ok: false, error: `Payment not captured (status: ${ride.payment_status ?? "unknown"}).` };
+    if (ride.fare_final == null) return { ok: false, error: "No final fare recorded." };
+
+    const chargedCents = Math.round(ride.fare_final * 100);
+    const priorRefunded = ride.refunded_amount_cents ?? 0;
+    const remaining = chargedCents - priorRefunded;
+    if (remaining <= 0) return { ok: false, error: "Already fully refunded." };
+
+    const amount = input.amountCents ?? remaining;
+    if (!Number.isInteger(amount) || amount <= 0)
+      return { ok: false, error: "Refund amount must be a positive whole number of cents." };
+    if (amount > remaining)
+      return { ok: false, error: `Refund exceeds the remaining balance ($${round2(remaining / 100)}).` };
+
+    // Issue the refund. metadata carries the who-absorbs-it decision to the
+    // webhook so it applies the clawback without racing our own DB write. The
+    // idempotency key folds in the prior-refunded total so a genuine second
+    // partial isn't collapsed into the first, but a double-submit of the SAME
+    // partial is.
+    const refund = await stripePost(
+      "/refunds",
+      {
+        payment_intent: ride.stripe_payment_intent_id,
+        amount: amount.toString(),
+        "metadata[ride_id]": ride.id,
+        "metadata[reason]": input.reason,
+        "metadata[absorbed_by]": absorbedBy,
+      },
+      `refund-${ride.id}-${priorRefunded}-${amount}`,
+    );
+    if (refund.error) {
+      return { ok: false, error: refund.error.message ?? "Stripe refused the refund." };
+    }
+
+    const newRefunded = priorRefunded + (refund.amount ?? amount);
+    const fullyRefunded = newRefunded >= chargedCents;
+
+    // Record for immediate display. The webhook will also write these (and, for
+    // driver_fault, perform the transfer clawback) — every field here is
+    // idempotent with it, so whichever lands second is harmless.
+    const patch: Record<string, unknown> = {
+      refunded_amount_cents: newRefunded,
+      refunded_at: new Date().toISOString(),
+      stripe_refund_id: refund.id,
+      refund_reason: input.reason,
+      refund_absorbed_by: absorbedBy,
+    };
+    if (fullyRefunded) patch.payment_status = "refunded";
+    await mgcj.from("rides").update(patch).eq("id", ride.id);
+
+    await writeAudit({
+      actorUserId: owner.id,
+      projectSlug: "mgcj",
+      action: "ride.refund",
+      target: ride.id,
+      after: {
+        amountCents: amount,
+        reason: input.reason,
+        absorbedBy,
+        refundId: refund.id,
+        fullyRefunded,
+      },
+    });
+
+    return {
+      ok: true,
+      refundId: refund.id,
+      amountCents: amount,
+      clawback: absorbedBy === "driver_company",
+    };
   } catch (e) {
     return { ok: false, error: (e as Error).message };
   }
