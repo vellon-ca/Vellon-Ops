@@ -1422,3 +1422,216 @@ export async function refundRide(input: {
     return { ok: false, error: (e as Error).message };
   }
 }
+
+// ── Refunds by reason (live from mgcj) ──────────────────────────────
+// Turns the single blended "refunds netted out of fees" figure on the Revenue
+// KPI into an accountable breakdown by WHY. Parallels Dispute costs: money
+// Vellon spent on refunds, billed to no company.
+//
+// Money figures per row (all mechanical, never re-derived from a live rate):
+//   grossRefunded = refunded_amount_cents          (what left Vellon's balance)
+//   clawedBack    = transfer_reversed_cents         (what came back off the driver/
+//                                                     company transfer)
+//   absorbed      = max(0, gross·(1 − pct/100) − clawed)   (Vellon's REAL loss)
+//
+// Why absorbed is NOT gross − clawed: the fare is transfer + Vellon-fee + Stripe
+// (see 20260730_ops_revenue_net_refunds.sql). The passenger paid the fee INSIDE
+// the fare and gets it back in the refund — money in, money out, a wash for
+// Vellon. gross − clawed is ops_revenue's *netting term* (only a loss once
+// subtracted from the booked fee); standalone it double-counts that fee. So we
+// strip the fee's share of the refund (gross·pct/100) and subtract the clawback.
+// Verified across cases (pct = the frozen platform_fee_percent_at_completion):
+//   • full vellon (clawed 0)       -> gross·(1−pct/100) = transfer + Stripe
+//   • full driver_fault (clawed=transfer) -> ≈ Stripe fee only (~$0)
+//   • partial driver_fault (clawed=refund) -> 0 (fee covers it)
+//   • FAILED driver_fault clawback (clawed 0) -> full transfer+Stripe, correctly
+//                                                 until it's manually recovered
+// max(0, …) guards the case where the fee alone exceeds the un-clawed remainder.
+// If pct is null (old/seeded rides), it falls back to gross − clawed — the safe
+// over-estimate. Refunds issued out-of-band (straight in Stripe) carry no reason
+// metadata and fall in 'uncategorized' rather than being dropped.
+//
+// Bucketed by refunded_at — when Vellon actually paid it — like Dispute costs
+// bucket by opened_at (a cost-incurred lens, deliberately NOT the ride's
+// completion month that ops_revenue nets against). Direct select rather than an
+// RPC: refunds are rare events, comfortably under the 1000-row page cap, same as
+// getStrandedSettlements.
+
+export type RefundReasonKey =
+  | "driver_fault"
+  | "platform_mistake"
+  | "goodwill"
+  | "uncategorized";
+
+function reasonKeyOf(reason: string | null): RefundReasonKey {
+  if (reason === "driver_fault" || reason === "platform_mistake" || reason === "goodwill") {
+    return reason;
+  }
+  return "uncategorized";
+}
+
+type RefundBucket = {
+  count: number;
+  grossRefunded: number;
+  clawedBack: number;
+  absorbed: number;
+};
+
+export type RefundsByReason = {
+  from: string;
+  to: string;
+  totals: RefundBucket;
+  byReason: ({ reason: RefundReasonKey } & RefundBucket)[];
+  byCompany: {
+    companyId: string;
+    companyName: string;
+    count: number;
+    absorbed: number;
+  }[];
+  recent: {
+    id: string;
+    companyName: string | null;
+    reason: RefundReasonKey;
+    grossRefunded: number;
+    absorbed: number;
+    refundedAt: string;
+  }[];
+};
+
+export async function getRefundsByReason(input: {
+  fromISO: string;
+  toISO: string;
+}): Promise<{ ok: true; data: RefundsByReason } | { ok: false; error: string }> {
+  await requirePlatformOwner();
+  try {
+    const mgcj = mgcjSupabase();
+    const { data, error } = await mgcj
+      .from("rides")
+      .select(
+        "id, company_id, refund_reason, refund_absorbed_by, refunded_amount_cents, transfer_reversed_cents, platform_fee_percent_at_completion, refunded_at",
+      )
+      .not("refunded_at", "is", null)
+      .gt("refunded_amount_cents", 0)
+      .gte("refunded_at", input.fromISO)
+      .lt("refunded_at", input.toISO)
+      .order("refunded_at", { ascending: false });
+    if (error) throw new Error(error.message);
+
+    // Vellon's real loss on a refund: strip the fee's share (a wash — see the
+    // header comment) and the clawback, floored at zero.
+    const absorbedOf = (
+      refundedCents: number | null,
+      reversedCents: number | null,
+      feePct: number | null,
+    ): number => {
+      const gross = (refundedCents ?? 0) / 100;
+      const clawed = (reversedCents ?? 0) / 100;
+      const pct = Number(feePct) || 0; // null/NaN -> 0 -> safe over-estimate
+      return Math.max(0, gross * (1 - pct / 100) - clawed);
+    };
+
+    const rows = data ?? [];
+
+    const companyIds = [...new Set(rows.map((r) => r.company_id).filter(Boolean))];
+    const names = new Map<string, string>();
+    if (companyIds.length > 0) {
+      const { data: companies } = await mgcj
+        .from("companies")
+        .select("id, name")
+        .in("id", companyIds);
+      for (const c of companies ?? []) names.set(c.id, c.name);
+    }
+
+    const emptyBucket = (): RefundBucket => ({
+      count: 0,
+      grossRefunded: 0,
+      clawedBack: 0,
+      absorbed: 0,
+    });
+    const totals = emptyBucket();
+    const byReason = new Map<RefundReasonKey, RefundBucket>();
+    const byCompany = new Map<string, RefundsByReason["byCompany"][number]>();
+
+    for (const r of rows) {
+      const gross = (r.refunded_amount_cents ?? 0) / 100;
+      const clawed = (r.transfer_reversed_cents ?? 0) / 100;
+      const absorbed = absorbedOf(
+        r.refunded_amount_cents,
+        r.transfer_reversed_cents,
+        r.platform_fee_percent_at_completion,
+      );
+      const key = reasonKeyOf(r.refund_reason);
+
+      const add = (b: RefundBucket) => {
+        b.count += 1;
+        b.grossRefunded += gross;
+        b.clawedBack += clawed;
+        b.absorbed += absorbed;
+      };
+      add(totals);
+      const rb = byReason.get(key) ?? emptyBucket();
+      add(rb);
+      byReason.set(key, rb);
+
+      const ck = r.company_id ?? "unattributed";
+      const c =
+        byCompany.get(ck) ??
+        {
+          companyId: ck,
+          companyName: names.get(ck) ?? "Unattributed",
+          count: 0,
+          absorbed: 0,
+        };
+      c.count += 1;
+      c.absorbed = round2(c.absorbed + absorbed);
+      byCompany.set(ck, c);
+    }
+
+    const finishBucket = (b: RefundBucket): RefundBucket => ({
+      count: b.count,
+      grossRefunded: round2(b.grossRefunded),
+      clawedBack: round2(b.clawedBack),
+      absorbed: round2(b.absorbed),
+    });
+
+    // Stable, meaningful order for the reason table.
+    const REASON_ORDER: RefundReasonKey[] = [
+      "platform_mistake",
+      "goodwill",
+      "driver_fault",
+      "uncategorized",
+    ];
+
+    return {
+      ok: true,
+      data: {
+        from: input.fromISO,
+        to: input.toISO,
+        totals: finishBucket(totals),
+        byReason: REASON_ORDER.filter((k) => byReason.has(k)).map((k) => ({
+          reason: k,
+          ...finishBucket(byReason.get(k)!),
+        })),
+        byCompany: [...byCompany.values()]
+          .map((c) => ({ ...c, absorbed: round2(c.absorbed) }))
+          .sort((a, b) => b.absorbed - a.absorbed),
+        recent: rows.slice(0, 25).map((r) => ({
+          id: r.id,
+          companyName: r.company_id ? names.get(r.company_id) ?? null : null,
+          reason: reasonKeyOf(r.refund_reason),
+          grossRefunded: round2((r.refunded_amount_cents ?? 0) / 100),
+          absorbed: round2(
+            absorbedOf(
+              r.refunded_amount_cents,
+              r.transfer_reversed_cents,
+              r.platform_fee_percent_at_completion,
+            ),
+          ),
+          refundedAt: r.refunded_at,
+        })),
+      },
+    };
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
+  }
+}

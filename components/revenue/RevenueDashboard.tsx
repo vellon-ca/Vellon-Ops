@@ -12,6 +12,7 @@ import {
   getDisputeCosts,
   getStrandedSettlements,
   getSettlementReconciliation,
+  getRefundsByReason,
   searchRefundableRides,
   refundRide,
   type RevenueSummary,
@@ -20,6 +21,8 @@ import {
   type StrandedSettlements,
   type SettlementReconciliation,
   type SettlementState,
+  type RefundsByReason,
+  type RefundReasonKey,
   type RefundableRide,
   type RefundReason,
 } from "@/app/(app)/revenue/actions";
@@ -200,6 +203,11 @@ export function RevenueDashboard() {
           />
 
           <DisputeSection
+            fromISO={rangeFor(PRESETS[preset].months).fromISO}
+            toISO={rangeFor(PRESETS[preset].months).toISO}
+          />
+
+          <RefundsByReasonSection
             fromISO={rangeFor(PRESETS[preset].months).fromISO}
             toISO={rangeFor(PRESETS[preset].months).toISO}
           />
@@ -1132,6 +1140,193 @@ function ActBtn({
     >
       {children}
     </button>
+  );
+}
+
+// ── Refunds by reason ───────────────────────────────────────────────
+// The blended "refunds netted out of fees" figure on the KPI row, broken out by
+// WHY — so platform mistakes (a signal to fix) read separately from goodwill (a
+// deliberate spend). Vellon's own cost of refunds, parallel to Dispute costs.
+const REASON_META: Record<
+  RefundReasonKey,
+  { label: string; dot: string; note: string }
+> = {
+  platform_mistake: {
+    label: "Platform mistake",
+    dot: "#e5484d",
+    note: "Vellon absorbs — a signal worth fixing",
+  },
+  goodwill: {
+    label: "Goodwill",
+    dot: "#c99a3a",
+    note: "Vellon absorbs — deliberate spend",
+  },
+  driver_fault: {
+    label: "Driver / company at fault",
+    dot: "#199e70",
+    note: "recovered via clawback — only the Stripe fee sticks (unless it failed)",
+  },
+  uncategorized: {
+    label: "Uncategorized",
+    dot: "#8a8f98",
+    note: "refunded out-of-band, no reason recorded",
+  },
+};
+
+function RefundsByReasonSection({ fromISO, toISO }: { fromISO: string; toISO: string }) {
+  const [data, setData] = useState<RefundsByReason | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [pending, startTransition] = useTransition();
+
+  const load = useCallback(() => {
+    startTransition(async () => {
+      const res = await getRefundsByReason({ fromISO, toISO });
+      if (res.ok) {
+        setData(res.data);
+        setError(null);
+      } else setError(res.error);
+    });
+  }, [fromISO, toISO]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  return (
+    <section>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <h2 className="text-sm font-semibold text-zinc-300">Refunds by reason</h2>
+          <p className="mt-0.5 text-xs text-zinc-500">
+            What Vellon absorbed on refunds, and why — bucketed by refund date.
+          </p>
+        </div>
+        {pending && <span className="text-xs text-zinc-600">…</span>}
+      </div>
+
+      {error && (
+        <p className="mt-3 rounded-md border border-red-900/50 bg-red-950/40 px-3 py-2 text-sm text-red-300">
+          {error}
+        </p>
+      )}
+
+      {data && data.totals.count === 0 && !error && (
+        <p className="mt-3 rounded-xl border border-zinc-800 px-4 py-6 text-center text-sm text-zinc-500">
+          No refunds in this range.
+        </p>
+      )}
+
+      {data && data.totals.count > 0 && (
+        <>
+          <div className="mt-3 grid grid-cols-2 gap-3 lg:grid-cols-4">
+            <Tile
+              label="Absorbed by Vellon"
+              value={"−" + cad(data.totals.absorbed)}
+              accent
+              sub="net of driver/company clawbacks"
+            />
+            <Tile
+              label="Gross refunded"
+              value={cad(data.totals.grossRefunded)}
+              sub="total paid back to passengers"
+            />
+            <Tile
+              label="Clawed back"
+              value={cad(data.totals.clawedBack)}
+              dot="#199e70"
+              sub="recovered from drivers/companies"
+            />
+            <Tile
+              label="Refunds"
+              value={String(data.totals.count)}
+              sub="in this range"
+            />
+          </div>
+
+          <p className="mt-2 text-xs text-zinc-600">
+            &ldquo;Absorbed&rdquo; is Vellon&apos;s real loss — the refund minus
+            the clawback <em>and</em> minus the platform fee, which the passenger
+            paid inside the fare and got back, a wash. So it&apos;s less than
+            gross minus clawback, and a fully clawed-back driver-fault refund
+            nets to just the Stripe fee.
+          </p>
+
+          {/* By reason — Gross and Absorbed only; clawback lives in the tile
+              above, since gross − clawed does NOT equal absorbed (the fee is
+              also netted out) and adjacent columns shouldn't imply it does. */}
+          <div className="mt-3 overflow-x-auto rounded-xl border border-zinc-800">
+            <table className="w-full min-w-[560px] text-left text-sm">
+              <thead>
+                <tr className="border-b border-zinc-800 text-xs uppercase tracking-wide text-zinc-500">
+                  <th className="px-4 py-2.5 font-medium">Reason</th>
+                  <th className="px-4 py-2.5 text-right font-medium">Refunds</th>
+                  <th className="px-4 py-2.5 text-right font-medium">Gross</th>
+                  <th className="px-4 py-2.5 text-right font-medium">Vellon absorbed</th>
+                </tr>
+              </thead>
+              <tbody>
+                {data.byReason.map((r) => (
+                  <tr key={r.reason} className="border-b border-zinc-900 last:border-0">
+                    <td className="px-4 py-2.5">
+                      <span className="flex items-center gap-2 text-zinc-200">
+                        <span
+                          className="inline-block h-2 w-2 rounded-full"
+                          style={{ background: REASON_META[r.reason].dot }}
+                        />
+                        {REASON_META[r.reason].label}
+                      </span>
+                      <span className="ml-4 text-xs text-zinc-600">
+                        {REASON_META[r.reason].note}
+                      </span>
+                    </td>
+                    <td className="px-4 py-2.5 text-right text-zinc-500">{r.count}</td>
+                    <td className="px-4 py-2.5 text-right text-zinc-400">
+                      {cad(r.grossRefunded)}
+                    </td>
+                    <td className="px-4 py-2.5 text-right font-medium text-zinc-100">
+                      {r.absorbed === 0 ? "—" : "−" + cad(r.absorbed)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+              <tfoot>
+                <tr className="border-t border-zinc-800 text-sm">
+                  <td className="px-4 py-2.5 text-zinc-500">All reasons</td>
+                  <td className="px-4 py-2.5 text-right text-zinc-500">
+                    {data.totals.count}
+                  </td>
+                  <td className="px-4 py-2.5 text-right text-zinc-400">
+                    {cad(data.totals.grossRefunded)}
+                  </td>
+                  <td className="px-4 py-2.5 text-right font-semibold text-accent">
+                    {"−" + cad(data.totals.absorbed)}
+                  </td>
+                </tr>
+              </tfoot>
+            </table>
+          </div>
+
+          {/* By company — only where Vellon actually absorbed something */}
+          {data.byCompany.some((c) => c.absorbed > 0) && (
+            <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+              {data.byCompany
+                .filter((c) => c.absorbed > 0)
+                .map((c) => (
+                  <div
+                    key={c.companyId}
+                    className="flex items-center justify-between rounded-lg border border-zinc-800 bg-zinc-900/40 px-3 py-2"
+                  >
+                    <span className="truncate text-sm text-zinc-300">{c.companyName}</span>
+                    <span className="ml-2 shrink-0 text-sm font-medium text-zinc-100">
+                      −{cad(c.absorbed)}
+                    </span>
+                  </div>
+                ))}
+            </div>
+          )}
+        </>
+      )}
+    </section>
   );
 }
 
