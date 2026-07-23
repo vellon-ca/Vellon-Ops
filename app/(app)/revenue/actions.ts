@@ -221,6 +221,207 @@ export async function getRevenue(input: {
   }
 }
 
+// ── Settlement reconciliation (live from mgcj) ──────────────────────
+// "Where did each company's card money actually go this period?" — the
+// company-wide rollup by settlement_route the per-ride views can't answer
+// ("did my drivers get paid this week?"). Sums the frozen transfer_amount_cents
+// snapshot per route; see 20260732_ops_settlement_reconciliation.sql for why
+// that column (never a live re-derivation) and why card-only.
+//
+// Raw routes are folded into a handful of health-lensed STATES so the UI reads
+// as an answer, not a taxonomy. Any route string not mapped here lands in
+// 'other' rather than vanishing, so a future settlement_route value still shows.
+
+export type SettlementState =
+  | "paid_drivers"
+  | "paid_companies"
+  | "held"
+  | "reversed"
+  | "attention"
+  | "unsettled"
+  | "other";
+
+// Note: reversed/clawed-back routes carry the ORIGINAL transfer_amount_cents,
+// which slightly overstates a *partial* driver_fault refund (refund_reversed) —
+// the snapshot isn't reduced by the clawed-back amount. Acceptable for this
+// rollup (it lives in the non-additive 'other'/reversed bucket, not a paid-out
+// figure); revisit only if partial refunds become common.
+const ROUTE_STATE: Record<string, SettlementState> = {
+  driver_transfer: "paid_drivers",
+  company_transfer: "paid_companies",
+  platform_invoiced: "held",
+  transfer_reversed: "reversed",
+  refund_reversed: "reversed",
+  transfer_failed: "attention",
+  reversal_failed: "attention",
+  retransfer_failed: "attention",
+  refund_review: "attention",
+  unsettled: "unsettled",
+};
+
+const stateOf = (route: string): SettlementState => ROUTE_STATE[route] ?? "other";
+
+type ReconRow = {
+  company_id: string;
+  company_name: string;
+  settlement_route: string;
+  ride_count: number;
+  transfer_total: number; // dollars
+  fares_total: number;
+};
+
+export type SettlementReconciliation = {
+  from: string;
+  to: string;
+  // Money + ride counts per health state, over the period.
+  byState: Record<SettlementState, { amount: number; rides: number }>;
+  totalTransferred: number; // everything, all states
+  totalRides: number;
+  attentionRides: number; // rides in the 'attention' state — the thing to act on
+  // Per company, the driver/company share split by state. The columns are
+  // exhaustive — paidDrivers + paidCompanies + held + attention + other == total
+  // for every row (and the footer) — so the table always reconciles. `other`
+  // folds reversed/unsettled/other-route money, which isn't cleanly "paid",
+  // "held", or "actionable" but must still be somewhere for the row to balance.
+  byCompany: {
+    companyId: string;
+    companyName: string;
+    paidDrivers: number;
+    paidCompanies: number;
+    held: number;
+    attention: number;
+    other: number;
+    total: number;
+    rides: number;
+  }[];
+  // The raw route breakdown, for the detail table (most money first).
+  byRoute: { route: string; state: SettlementState; amount: number; rides: number }[];
+};
+
+const emptyState = (): SettlementReconciliation["byState"] => ({
+  paid_drivers: { amount: 0, rides: 0 },
+  paid_companies: { amount: 0, rides: 0 },
+  held: { amount: 0, rides: 0 },
+  reversed: { amount: 0, rides: 0 },
+  attention: { amount: 0, rides: 0 },
+  unsettled: { amount: 0, rides: 0 },
+  other: { amount: 0, rides: 0 },
+});
+
+export async function getSettlementReconciliation(input: {
+  fromISO: string;
+  toISO: string;
+}): Promise<
+  { ok: true; data: SettlementReconciliation } | { ok: false; error: string }
+> {
+  await requirePlatformOwner();
+  try {
+    const mgcj = mgcjSupabase();
+    const { data, error } = await mgcj.rpc("ops_settlement_reconciliation", {
+      p_from: input.fromISO,
+      p_to: input.toISO,
+    });
+    if (error) {
+      const msg = isMissingSchema(error)
+        ? "Settlement reconciliation needs 20260732_ops_settlement_reconciliation.sql applied in the mgcj SQL editor (then NOTIFY pgrst, 'reload schema')."
+        : error.message;
+      return { ok: false, error: msg };
+    }
+
+    const rows: ReconRow[] = (data ?? []).map((r: ReconRow) => ({
+      company_id: r.company_id,
+      company_name: r.company_name,
+      settlement_route: r.settlement_route,
+      ride_count: Number(r.ride_count),
+      transfer_total: Number(r.transfer_total),
+      fares_total: Number(r.fares_total),
+    }));
+
+    const byState = emptyState();
+    const byRoute = new Map<string, SettlementReconciliation["byRoute"][number]>();
+    const companies = new Map<string, SettlementReconciliation["byCompany"][number]>();
+    let totalTransferred = 0;
+    let totalRides = 0;
+
+    for (const r of rows) {
+      const state = stateOf(r.settlement_route);
+      byState[state].amount = round2(byState[state].amount + r.transfer_total);
+      byState[state].rides += r.ride_count;
+      totalTransferred = round2(totalTransferred + r.transfer_total);
+      totalRides += r.ride_count;
+
+      const rt =
+        byRoute.get(r.settlement_route) ??
+        { route: r.settlement_route, state, amount: 0, rides: 0 };
+      rt.amount = round2(rt.amount + r.transfer_total);
+      rt.rides += r.ride_count;
+      byRoute.set(r.settlement_route, rt);
+
+      const c =
+        companies.get(r.company_id) ??
+        {
+          companyId: r.company_id,
+          companyName: r.company_name,
+          paidDrivers: 0,
+          paidCompanies: 0,
+          held: 0,
+          attention: 0,
+          other: 0,
+          total: 0,
+          rides: 0,
+        };
+      // Accumulate raw (unrounded) so the final round can't leave the columns
+      // failing to sum to the total.
+      if (state === "paid_drivers") c.paidDrivers += r.transfer_total;
+      else if (state === "paid_companies") c.paidCompanies += r.transfer_total;
+      else if (state === "held") c.held += r.transfer_total;
+      else if (state === "attention") c.attention += r.transfer_total;
+      // reversed / unsettled / other — clawed-back or never-transferred money;
+      // parked here so every dollar lands in exactly one column.
+      else c.other += r.transfer_total;
+      c.rides += r.ride_count;
+      companies.set(r.company_id, c);
+    }
+
+    // Round each column once, then define total as the sum of the rounded
+    // columns — guarantees the row (and footer) reconciles to the cent.
+    const byCompany = [...companies.values()].map((c) => {
+      const paidDrivers = round2(c.paidDrivers);
+      const paidCompanies = round2(c.paidCompanies);
+      const held = round2(c.held);
+      const attention = round2(c.attention);
+      const other = round2(c.other);
+      return {
+        companyId: c.companyId,
+        companyName: c.companyName,
+        paidDrivers,
+        paidCompanies,
+        held,
+        attention,
+        other,
+        total: round2(paidDrivers + paidCompanies + held + attention + other),
+        rides: c.rides,
+      };
+    });
+
+    return {
+      ok: true,
+      data: {
+        from: input.fromISO,
+        to: input.toISO,
+        byState,
+        totalTransferred: round2(totalTransferred),
+        totalRides,
+        attentionRides: byState.attention.rides,
+        byCompany: byCompany.sort((a, b) => b.total - a.total),
+        byRoute: [...byRoute.values()].sort((a, b) => b.amount - a.amount),
+      },
+    };
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
+  }
+}
+
 // ── Invoices (hub DB) ───────────────────────────────────────────────
 export type Invoice = {
   id: string;

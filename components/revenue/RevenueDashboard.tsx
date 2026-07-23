@@ -11,12 +11,15 @@ import {
   syncDisputeCosts,
   getDisputeCosts,
   getStrandedSettlements,
+  getSettlementReconciliation,
   searchRefundableRides,
   refundRide,
   type RevenueSummary,
   type Invoice,
   type DisputeCosts,
   type StrandedSettlements,
+  type SettlementReconciliation,
+  type SettlementState,
   type RefundableRide,
   type RefundReason,
 } from "@/app/(app)/revenue/actions";
@@ -191,6 +194,11 @@ export function RevenueDashboard() {
             </div>
           </section>
 
+          <SettlementSection
+            fromISO={rangeFor(PRESETS[preset].months).fromISO}
+            toISO={rangeFor(PRESETS[preset].months).toISO}
+          />
+
           <DisputeSection
             fromISO={rangeFor(PRESETS[preset].months).fromISO}
             toISO={rangeFor(PRESETS[preset].months).toISO}
@@ -202,6 +210,277 @@ export function RevenueDashboard() {
         </div>
       )}
     </div>
+  );
+}
+
+// ── Settlement reconciliation ───────────────────────────────────────
+// Company-wide answer to "where did each company's card money actually go this
+// period?" — the rollup by settlement state that per-ride views can't give.
+// Sums the frozen transfer_amount_cents snapshot; see getSettlementReconciliation.
+
+// Human labels for the raw settlement_route values, for the detail table.
+const ROUTE_LABEL: Record<string, string> = {
+  driver_transfer: "Paid to driver",
+  company_transfer: "Paid to company",
+  platform_invoiced: "Held on platform",
+  transfer_failed: "Transfer failed",
+  transfer_reversed: "Reversed (dispute)",
+  refund_reversed: "Clawed back (refund)",
+  reversal_failed: "Clawback failed",
+  retransfer_failed: "Re-payment failed",
+  refund_review: "Refunded out-of-band",
+  unsettled: "Unsettled",
+};
+const routeLabel = (r: string) => ROUTE_LABEL[r] ?? r.replace(/_/g, " ");
+
+const STATE_META: Record<
+  SettlementState,
+  { label: string; dot: string; sub: string }
+> = {
+  paid_drivers: {
+    label: "Paid to drivers",
+    dot: "#199e70",
+    sub: "driver_direct, straight to their account",
+  },
+  paid_companies: {
+    label: "Paid to companies",
+    dot: "#3987e5",
+    sub: "company settles with drivers",
+  },
+  held: {
+    label: "Held / pending sweep",
+    dot: "#c99a3a",
+    sub: "no Connect account yet — swept hourly",
+  },
+  reversed: {
+    label: "Reversed",
+    dot: "#8a8f98",
+    sub: "clawed back by a dispute or refund",
+  },
+  attention: {
+    label: "Needs attention",
+    dot: "#e5484d",
+    sub: "failed transfers / manual review",
+  },
+  unsettled: {
+    label: "Unsettled",
+    dot: "#6a6f78",
+    sub: "completed card ride, no transfer recorded",
+  },
+  other: {
+    label: "Other",
+    dot: "#6a6f78",
+    sub: "unrecognized settlement route",
+  },
+};
+
+// Order the state tiles by operational salience, not amount.
+const STATE_ORDER: SettlementState[] = [
+  "paid_drivers",
+  "paid_companies",
+  "held",
+  "attention",
+  "reversed",
+  "unsettled",
+  "other",
+];
+
+function SettlementSection({ fromISO, toISO }: { fromISO: string; toISO: string }) {
+  const [data, setData] = useState<SettlementReconciliation | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [pending, startTransition] = useTransition();
+
+  const load = useCallback(() => {
+    startTransition(async () => {
+      const res = await getSettlementReconciliation({ fromISO, toISO });
+      if (res.ok) {
+        setData(res.data);
+        setError(null);
+      } else setError(res.error);
+    });
+  }, [fromISO, toISO]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  // Only render a state tile if it has activity — keeps the row focused on what
+  // actually happened this period rather than a grid of zeros.
+  const activeStates = data
+    ? STATE_ORDER.filter((s) => data.byState[s].rides > 0)
+    : [];
+
+  // Footer sums the per-company columns (not byState) so it reconciles to the
+  // exact same cent as the rows above it — total == the five columns' sum.
+  const footer = useMemo(() => {
+    const f = { paidDrivers: 0, paidCompanies: 0, held: 0, attention: 0, other: 0, total: 0 };
+    for (const c of data?.byCompany ?? []) {
+      f.paidDrivers += c.paidDrivers;
+      f.paidCompanies += c.paidCompanies;
+      f.held += c.held;
+      f.attention += c.attention;
+      f.other += c.other;
+      f.total += c.total;
+    }
+    return f;
+  }, [data]);
+
+  return (
+    <section>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <h2 className="text-sm font-semibold text-zinc-300">
+            Settlement reconciliation
+          </h2>
+          <p className="mt-0.5 text-xs text-zinc-500">
+            Where each company&apos;s <em>card</em> money landed this period —
+            the driver/company share, by settlement state.
+          </p>
+        </div>
+        {pending && <span className="text-xs text-zinc-600">…</span>}
+      </div>
+
+      {error && (
+        <p className="mt-3 rounded-md border border-red-900/50 bg-red-950/40 px-3 py-2 text-sm text-red-300">
+          {error}
+        </p>
+      )}
+
+      {data && data.totalRides === 0 && !error && (
+        <p className="mt-3 rounded-xl border border-zinc-800 px-4 py-6 text-center text-sm text-zinc-500">
+          No completed card rides in this range.
+        </p>
+      )}
+
+      {data && data.totalRides > 0 && (
+        <>
+          {data.attentionRides > 0 && (
+            <p className="mt-3 rounded-md border border-red-900/50 bg-red-950/30 px-3 py-2 text-sm text-red-300">
+              {data.attentionRides} ride{data.attentionRides === 1 ? "" : "s"} in a
+              failed or manual-review state ({cad(data.byState.attention.amount)}).
+              See the routes below — these are also on the Needs Attention list.
+            </p>
+          )}
+
+          {/* State tiles */}
+          <div className="mt-3 grid grid-cols-2 gap-3 lg:grid-cols-4">
+            {activeStates.map((s) => (
+              <Tile
+                key={s}
+                label={STATE_META[s].label}
+                value={cad(data.byState[s].amount)}
+                dot={STATE_META[s].dot}
+                sub={`${data.byState[s].rides} ride${
+                  data.byState[s].rides === 1 ? "" : "s"
+                } · ${STATE_META[s].sub}`}
+              />
+            ))}
+          </div>
+
+          {/* By company. Columns are exhaustive and reconcile: drivers +
+              company + held + attention + other == total, per row and footer. */}
+          <div className="mt-4 overflow-x-auto rounded-xl border border-zinc-800">
+            <table className="w-full min-w-[820px] text-left text-sm">
+              <thead>
+                <tr className="border-b border-zinc-800 text-xs uppercase tracking-wide text-zinc-500">
+                  <th className="px-4 py-2.5 font-medium">Company</th>
+                  <th className="px-4 py-2.5 text-right font-medium">To drivers</th>
+                  <th className="px-4 py-2.5 text-right font-medium">To company</th>
+                  <th className="px-4 py-2.5 text-right font-medium">Held</th>
+                  <th className="px-4 py-2.5 text-right font-medium">Attention</th>
+                  <th className="px-4 py-2.5 text-right font-medium">Other</th>
+                  <th className="px-4 py-2.5 text-right font-medium">Total</th>
+                  <th className="px-4 py-2.5 text-right font-medium">Rides</th>
+                </tr>
+              </thead>
+              <tbody>
+                {data.byCompany.map((c) => (
+                  <tr key={c.companyId} className="border-b border-zinc-900 last:border-0">
+                    <td className="px-4 py-2.5 text-zinc-200">{c.companyName}</td>
+                    <td className="px-4 py-2.5 text-right text-zinc-400">
+                      {c.paidDrivers > 0 ? cad(c.paidDrivers) : "—"}
+                    </td>
+                    <td className="px-4 py-2.5 text-right text-zinc-400">
+                      {c.paidCompanies > 0 ? cad(c.paidCompanies) : "—"}
+                    </td>
+                    <td className="px-4 py-2.5 text-right text-amber-300/80">
+                      {c.held > 0 ? cad(c.held) : "—"}
+                    </td>
+                    <td className="px-4 py-2.5 text-right text-red-300/80">
+                      {c.attention > 0 ? cad(c.attention) : "—"}
+                    </td>
+                    <td className="px-4 py-2.5 text-right text-zinc-500">
+                      {c.other !== 0 ? cad(c.other) : "—"}
+                    </td>
+                    <td className="px-4 py-2.5 text-right font-medium text-zinc-100">
+                      {cad(c.total)}
+                    </td>
+                    <td className="px-4 py-2.5 text-right text-zinc-500">{c.rides}</td>
+                  </tr>
+                ))}
+              </tbody>
+              <tfoot>
+                <tr className="border-t border-zinc-800 text-sm">
+                  <td className="px-4 py-2.5 text-zinc-500">All companies</td>
+                  <td className="px-4 py-2.5 text-right text-zinc-400">
+                    {cad(footer.paidDrivers)}
+                  </td>
+                  <td className="px-4 py-2.5 text-right text-zinc-400">
+                    {cad(footer.paidCompanies)}
+                  </td>
+                  <td className="px-4 py-2.5 text-right text-amber-300/80">
+                    {cad(footer.held)}
+                  </td>
+                  <td className="px-4 py-2.5 text-right text-red-300/80">
+                    {cad(footer.attention)}
+                  </td>
+                  <td className="px-4 py-2.5 text-right text-zinc-500">
+                    {cad(footer.other)}
+                  </td>
+                  <td className="px-4 py-2.5 text-right font-semibold text-zinc-100">
+                    {cad(footer.total)}
+                  </td>
+                  <td className="px-4 py-2.5 text-right text-zinc-500">
+                    {data.totalRides}
+                  </td>
+                </tr>
+              </tfoot>
+            </table>
+          </div>
+
+          {/* Raw route detail — the exact settlement_route breakdown */}
+          <details className="mt-3 rounded-xl border border-zinc-800">
+            <summary className="cursor-pointer px-4 py-2.5 text-xs font-medium uppercase tracking-wide text-zinc-500 hover:text-zinc-300">
+              Route detail
+            </summary>
+            <div className="overflow-x-auto border-t border-zinc-800">
+              <table className="w-full min-w-[480px] text-left text-sm">
+                <tbody>
+                  {data.byRoute.map((r) => (
+                    <tr key={r.route} className="border-b border-zinc-900 last:border-0">
+                      <td className="px-4 py-2.5">
+                        <span className="flex items-center gap-2 text-zinc-300">
+                          <span
+                            className="inline-block h-2 w-2 rounded-full"
+                            style={{ background: STATE_META[r.state].dot }}
+                          />
+                          {routeLabel(r.route)}
+                          <code className="text-[10px] text-zinc-600">{r.route}</code>
+                        </span>
+                      </td>
+                      <td className="px-4 py-2.5 text-right text-zinc-500">{r.rides}</td>
+                      <td className="px-4 py-2.5 text-right font-medium text-zinc-200">
+                        {cad(r.amount)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </details>
+        </>
+      )}
+    </section>
   );
 }
 
