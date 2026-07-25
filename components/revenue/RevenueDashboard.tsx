@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState, useTransition } from "react";
 import {
-  getRevenue,
+  getRevenueOverview,
   generateInvoices,
   listInvoices,
   updateInvoiceStatus,
@@ -71,20 +71,36 @@ function rangeFor(months: number): { fromISO: string; toISO: string } {
   return { fromISO: from.toISOString(), toISO: to.toISOString() };
 }
 
+// Result slices from the combined overview load, threaded down to each section
+// so the dashboard renders from one round-trip instead of each section
+// self-fetching on mount.
+type SettlementResult = Awaited<ReturnType<typeof getSettlementReconciliation>>;
+type DisputeCostsResult = Awaited<ReturnType<typeof getDisputeCosts>>;
+type StrandedResult = Awaited<ReturnType<typeof getStrandedSettlements>>;
+type RefundsResult = Awaited<ReturnType<typeof getRefundsByReason>>;
+
 export function RevenueDashboard() {
   const [preset, setPreset] = useState(2); // "6 months"
   const [rev, setRev] = useState<RevenueSummary | null>(null);
+  const [settlement, setSettlement] = useState<SettlementResult | null>(null);
+  const [disputeCosts, setDisputeCosts] = useState<DisputeCostsResult | null>(null);
+  const [stranded, setStranded] = useState<StrandedResult | null>(null);
+  const [refunds, setRefunds] = useState<RefundsResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [pending, startTransition] = useTransition();
 
   const load = useCallback(() => {
     const { fromISO, toISO } = rangeFor(PRESETS[preset].months);
     startTransition(async () => {
-      const res = await getRevenue({ fromISO, toISO });
-      if (res.ok) {
-        setRev(res.data);
+      const res = await getRevenueOverview({ fromISO, toISO });
+      if (res.revenue.ok) {
+        setRev(res.revenue.data);
         setError(null);
-      } else setError(res.error);
+      } else setError(res.revenue.error);
+      setSettlement(res.settlement);
+      setDisputeCosts(res.disputeCosts);
+      setStranded(res.stranded);
+      setRefunds(res.refunds);
     });
   }, [preset]);
 
@@ -200,16 +216,20 @@ export function RevenueDashboard() {
           <SettlementSection
             fromISO={rangeFor(PRESETS[preset].months).fromISO}
             toISO={rangeFor(PRESETS[preset].months).toISO}
+            preloaded={settlement}
           />
 
           <DisputeSection
             fromISO={rangeFor(PRESETS[preset].months).fromISO}
             toISO={rangeFor(PRESETS[preset].months).toISO}
+            preloadedCosts={disputeCosts}
+            preloadedStranded={stranded}
           />
 
           <RefundsByReasonSection
             fromISO={rangeFor(PRESETS[preset].months).fromISO}
             toISO={rangeFor(PRESETS[preset].months).toISO}
+            preloaded={refunds}
           />
 
           <RefundSection />
@@ -293,7 +313,15 @@ const STATE_ORDER: SettlementState[] = [
   "other",
 ];
 
-function SettlementSection({ fromISO, toISO }: { fromISO: string; toISO: string }) {
+function SettlementSection({
+  fromISO,
+  toISO,
+  preloaded,
+}: {
+  fromISO: string;
+  toISO: string;
+  preloaded: SettlementResult | null;
+}) {
   const [data, setData] = useState<SettlementReconciliation | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [pending, startTransition] = useTransition();
@@ -308,9 +336,17 @@ function SettlementSection({ fromISO, toISO }: { fromISO: string; toISO: string 
     });
   }, [fromISO, toISO]);
 
+  // Seed from the parent's combined load; self-fetch only if it wasn't provided.
   useEffect(() => {
-    load();
-  }, [load]);
+    if (preloaded) {
+      if (preloaded.ok) {
+        setData(preloaded.data);
+        setError(null);
+      } else setError(preloaded.error);
+    } else {
+      load();
+    }
+  }, [preloaded, load]);
 
   // Only render a state tile if it has activity — keeps the row focused on what
   // actually happened this period rather than a grid of zeros.
@@ -495,7 +531,17 @@ function SettlementSection({ fromISO, toISO }: { fromISO: string; toISO: string 
 // ── Dispute costs ───────────────────────────────────────────────────
 // Vellon's own cost of chargebacks — money that touches no ride's settlement
 // math and is therefore invisible everywhere else on the platform.
-function DisputeSection({ fromISO, toISO }: { fromISO: string; toISO: string }) {
+function DisputeSection({
+  fromISO,
+  toISO,
+  preloadedCosts,
+  preloadedStranded,
+}: {
+  fromISO: string;
+  toISO: string;
+  preloadedCosts: DisputeCostsResult | null;
+  preloadedStranded: StrandedResult | null;
+}) {
   const [costs, setCosts] = useState<DisputeCosts | null>(null);
   const [stranded, setStranded] = useState<StrandedSettlements | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -514,9 +560,20 @@ function DisputeSection({ fromISO, toISO }: { fromISO: string; toISO: string }) 
     });
   }, [fromISO, toISO]);
 
+  // Seed from the parent's combined load; self-fetch only if it wasn't provided.
   useEffect(() => {
-    load();
-  }, [load]);
+    if (preloadedCosts || preloadedStranded) {
+      if (preloadedCosts) {
+        if (preloadedCosts.ok) {
+          setCosts(preloadedCosts.data);
+          setError(null);
+        } else setError(preloadedCosts.error);
+      }
+      if (preloadedStranded?.ok) setStranded(preloadedStranded.data);
+    } else {
+      load();
+    }
+  }, [preloadedCosts, preloadedStranded, load]);
 
   const sync = () => {
     startTransition(async () => {
@@ -1173,7 +1230,15 @@ const REASON_META: Record<
   },
 };
 
-function RefundsByReasonSection({ fromISO, toISO }: { fromISO: string; toISO: string }) {
+function RefundsByReasonSection({
+  fromISO,
+  toISO,
+  preloaded,
+}: {
+  fromISO: string;
+  toISO: string;
+  preloaded: RefundsResult | null;
+}) {
   const [data, setData] = useState<RefundsByReason | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [pending, startTransition] = useTransition();
@@ -1188,9 +1253,17 @@ function RefundsByReasonSection({ fromISO, toISO }: { fromISO: string; toISO: st
     });
   }, [fromISO, toISO]);
 
+  // Seed from the parent's combined load; self-fetch only if it wasn't provided.
   useEffect(() => {
-    load();
-  }, [load]);
+    if (preloaded) {
+      if (preloaded.ok) {
+        setData(preloaded.data);
+        setError(null);
+      } else setError(preloaded.error);
+    } else {
+      load();
+    }
+  }, [preloaded, load]);
 
   return (
     <section>

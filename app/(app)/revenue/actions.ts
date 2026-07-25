@@ -1635,3 +1635,35 @@ export async function getRefundsByReason(input: {
     return { ok: false, error: (e as Error).message };
   }
 }
+
+// ── Combined dashboard load ─────────────────────────────────────────
+// The Revenue dashboard's five on-mount reads collapse into this single
+// server action. Two wins over calling them separately from the client:
+//   1. Next.js serializes concurrent server actions, so five separate calls
+//      ran back-to-back; here the five reads run in parallel via Promise.all.
+//   2. requirePlatformOwner() is called once for the whole request — the
+//      per-action guards inside each read hit the request-scoped cache()
+//      instead of re-verifying, so there's one auth check, not five.
+// Invoices (their own month selector) and the refund search (interactive)
+// stay separate on purpose.
+export async function getRevenueOverview(input: {
+  fromISO: string;
+  toISO: string;
+}): Promise<{
+  revenue: Awaited<ReturnType<typeof getRevenue>>;
+  settlement: Awaited<ReturnType<typeof getSettlementReconciliation>>;
+  disputeCosts: Awaited<ReturnType<typeof getDisputeCosts>>;
+  stranded: Awaited<ReturnType<typeof getStrandedSettlements>>;
+  refunds: Awaited<ReturnType<typeof getRefundsByReason>>;
+}> {
+  await requirePlatformOwner();
+  const [revenue, settlement, disputeCosts, stranded, refunds] =
+    await Promise.all([
+      getRevenue(input),
+      getSettlementReconciliation(input),
+      getDisputeCosts(input),
+      getStrandedSettlements(),
+      getRefundsByReason(input),
+    ]);
+  return { revenue, settlement, disputeCosts, stranded, refunds };
+}

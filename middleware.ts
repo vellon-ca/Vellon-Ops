@@ -30,15 +30,21 @@ export async function middleware(request: NextRequest) {
     },
   );
 
+  // getClaims() refreshes the session cookie (like getUser) but verifies the
+  // JWT signature locally via cached JWKS when asymmetric signing keys are on —
+  // no auth-server round-trip on every request. Falls back to getUser() on
+  // legacy HS256, so it's never weaker. The definitive allowlist check still
+  // happens server-side in requirePlatformOwner().
   const {
-    data: { user },
-  } = await supabase.auth.getUser();
+    data,
+  } = await supabase.auth.getClaims();
+  const authed = !!data?.claims?.sub;
 
   const { pathname } = request.nextUrl;
   const isPublic =
     pathname.startsWith("/login") || pathname.startsWith("/auth");
 
-  if (!user && !isPublic) {
+  if (!authed && !isPublic) {
     return NextResponse.redirect(new URL("/login", request.url));
   }
 
