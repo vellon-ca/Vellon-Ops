@@ -361,6 +361,10 @@ function ReportDetailModal({
         </div>
 
         <div className="mt-4 divide-y divide-zinc-800">
+          {/* The reference the reporter also has — it is in the subject line of
+              the email that brought this in, so a reply thread and this row can
+              be matched up. Same value on both report kinds. */}
+          <DetailRow label="Reference" value={report.reportRef} />
           {source === "dispatch" ? (
             <>
               <DetailRow label="Company" value={report.companyName} />

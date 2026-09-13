@@ -10,6 +10,9 @@ export type ActionResult<T> =
 
 export type DispatchReport = {
   id: string;
+  // Human-readable reference (mgcj 20260777), e.g. "DP-K7M4Q2". The prefix is
+  // stored, so a ref names which of the three report tables it belongs to.
+  reportRef: string;
   companyId: string;
   companyName: string;
   adminName: string | null;
@@ -21,6 +24,7 @@ export type DispatchReport = {
 
 export type TechnicalReport = {
   id: string;
+  reportRef: string;
   reporterId: string;
   reporterName: string | null;
   reporterRole: "passenger" | "driver";
@@ -49,12 +53,12 @@ export async function getReports(): Promise<ActionResult<Reports>> {
     await Promise.all([
       mgcj
         .from("dispatch_reports")
-        .select("id, company_id, admin_id, category, message, status, created_at")
+        .select("id, report_ref, company_id, admin_id, category, message, status, created_at")
         .order("created_at", { ascending: false }),
       mgcj
         .from("technical_reports")
         .select(
-          "id, reporter_id, reporter_role, company_id, ride_id, category, message, status, created_at",
+          "id, report_ref, reporter_id, reporter_role, company_id, ride_id, category, message, status, created_at",
         )
         .order("created_at", { ascending: false }),
     ]);
@@ -84,6 +88,7 @@ export async function getReports(): Promise<ActionResult<Reports>> {
 
   const dispatch: DispatchReport[] = (dispatchRows ?? []).map((r) => ({
     id: r.id,
+    reportRef: r.report_ref,
     companyId: r.company_id,
     companyName: companyName.get(r.company_id) ?? "—",
     adminName: profileName.get(r.admin_id) ?? null,
@@ -95,6 +100,7 @@ export async function getReports(): Promise<ActionResult<Reports>> {
 
   const technical: TechnicalReport[] = (technicalRows ?? []).map((r) => ({
     id: r.id,
+    reportRef: r.report_ref,
     reporterId: r.reporter_id,
     reporterName: profileName.get(r.reporter_id) ?? null,
     reporterRole: r.reporter_role,
