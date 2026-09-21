@@ -34,10 +34,12 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          # Pinned. No `engines.node` in package.json, so without this the
-          # runner drifts onto whatever setup-node defaults to that month and
-          # fails on something no local machine can reproduce.
-          node-version: 20
+          # Single source of truth: `engines.node` in package.json, which Vercel
+          # reads too. Hardcoding a number here is what let CI sit on 20 while
+          # Vercel built on 24 — a gate passing on a runtime production does not
+          # use. Do not replace this with a literal, and do not add a .nvmrc:
+          # Vercel does not read one, so it would be a second copy that drifts.
+          node-version-file: package.json
           cache: npm
 
       # `ci` not `install`: installs strictly from the lockfile, and fails loudly
