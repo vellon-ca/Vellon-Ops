@@ -50,3 +50,19 @@ Don't assume future spokes share mgcj's schema — the connector pattern exists 
 
 - No automated tests (no test runner configured).
 - No CLAUDE.md existed for this repo before 2026-07-19 — if you find stale detail here, it likely just hasn't been updated yet rather than being deliberately wrong; fix it when you notice it drifting from the code.
+
+---
+
+## CI (`.github/workflows/`)
+
+- **`secret-scan.yml`** — gitleaks over full history.
+- **`build.yml`** — `npm ci` + `npm run build` + `npm run typecheck`. Runs with **dummy**
+  env and needs no secrets: every route is dynamic (server-rendered on demand), so nothing
+  queries Supabase or Stripe while compiling. The dummy `MGCJ_STRIPE_SECRET` still starts
+  with `sk_` because `lib/connectors/mgcj.ts` throws otherwise, by design.
+
+No `--no-lint` flag: ESLint is not a dependency and there is no config, so `next build` runs
+no linting and the CI command stays byte-identical to what Vercel runs. (Note `next lint`
+drops into an interactive setup prompt, which would hang a runner — don't add it casually.)
+
+Typecheck is a separate step from the build so a type error reports as a type error.
