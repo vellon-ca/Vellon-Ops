@@ -1,0 +1,63 @@
+name: build
+
+# Compile gate. Answers one question: does this commit build?
+#
+# Vercel already builds on push, but it does so AFTER the commit lands, and it
+# reports as a deployment failure rather than as a mark on the change that
+# caused it. This runs on the commit itself.
+#
+# NO SECRETS NEEDED — and that is deliberate, not luck. Every route here is
+# dynamic (server-rendered on demand), so nothing queries Supabase or Stripe
+# while compiling; dummy values compile identically to real ones. Keeping this
+# job secret-free means CI never becomes another place live keys live. The
+# values below are shaped like the real ones only so far as the code's own
+# guards require — `MGCJ_STRIPE_SECRET` must start with `sk_` or the connector
+# throws by design.
+#
+# Lint: there is no ESLint config in this repo and eslint is not a dependency,
+# so `next build` runs no linting and `next lint` drops into an interactive
+# setup prompt (which would hang a runner). Nothing to gate on, so no --no-lint
+# flag is needed — this stays byte-identical to what Vercel runs.
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # Pinned. No `engines.node` in package.json, so without this the
+          # runner drifts onto whatever setup-node defaults to that month and
+          # fails on something no local machine can reproduce.
+          node-version: 20
+          cache: npm
+
+      # `ci` not `install`: installs strictly from the lockfile, and fails loudly
+      # if the lockfile has drifted from package.json — itself worth knowing.
+      - name: Install
+        run: npm ci
+
+      - name: Build
+        env:
+          NEXT_PUBLIC_SUPABASE_URL: https://ci-dummy.supabase.co
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: ci-dummy-value-not-a-real-key
+          SUPABASE_SERVICE_ROLE_KEY: ci-dummy-value-not-a-real-key
+          MGCJ_SUPABASE_URL: https://ci-dummy.supabase.co
+          MGCJ_SUPABASE_SERVICE_ROLE: ci-dummy-value-not-a-real-key
+          MGCJ_STRIPE_SECRET: sk_test_ci_dummy_value_not_a_real_key
+          RESEND_API_KEY: ci-dummy-value-not-a-real-key
+        run: npm run build
+
+      # Separate from the build so a type error reports as a type error.
+      # `next build` does not fail on type errors in every configuration; this
+      # makes the check explicit rather than relying on that.
+      - name: Typecheck
+        run: npm run typecheck
