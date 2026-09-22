@@ -5,17 +5,19 @@ import {
   getCompanyForEdit,
   updateCompany,
   type CompanyDetail,
-} from "@/app/(app)/onboarding/actions";
+} from "@/app/(app)/[slug]/onboarding/actions";
 
 const input =
   "w-full rounded-md border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-zinc-100 outline-none focus:border-accent";
 const label = "block text-sm font-medium text-zinc-400";
 
 export function EditCompanyModal({
+  slug,
   companyId,
   onClose,
   onSaved,
 }: {
+  slug: string;
   companyId: string;
   onClose: () => void;
   onSaved: () => void;
@@ -26,7 +28,7 @@ export function EditCompanyModal({
 
   useEffect(() => {
     let cancelled = false;
-    getCompanyForEdit(companyId).then((res) => {
+    getCompanyForEdit(slug, companyId).then((res) => {
       if (cancelled) return;
       if (res.ok) setCompany(res.data);
       else setError(res.error);
@@ -39,7 +41,7 @@ export function EditCompanyModal({
   function submit(f: FormData) {
     setError(null);
     startTransition(async () => {
-      const res = await updateCompany({
+      const res = await updateCompany(slug, {
         companyId,
         name: String(f.get("name")),
         platformFeePercent: Number(f.get("fee")),

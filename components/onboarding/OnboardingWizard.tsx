@@ -14,7 +14,7 @@ import {
   type DispatcherResult,
   type StripeStatus,
   type CompanyDetail,
-} from "@/app/(app)/onboarding/actions";
+} from "@/app/(app)/[slug]/onboarding/actions";
 
 const STEPS = ["Company", "Admin", "Dispatchers", "Invites", "Stripe", "Done"] as const;
 
@@ -42,7 +42,7 @@ function resumeStep(r: CompanyDetail): number {
   return 2; // admin done, Stripe not started → offer dispatchers next
 }
 
-export function OnboardingWizard() {
+export function OnboardingWizard({ slug }: { slug: string }) {
   // Companies page links here as /onboarding?resume=<id> for anything not
   // yet fully onboarded — fetch that company and seed the wizard with it.
   const resumeId = useSearchParams().get("resume");
@@ -95,7 +95,7 @@ export function OnboardingWizard() {
   useEffect(() => {
     if (!resumeId || resumeId === prevResumeId.current) return;
     prevResumeId.current = resumeId;
-    getCompanyForEdit(resumeId).then((res) => {
+    getCompanyForEdit(slug, resumeId).then((res) => {
       if (!res.ok) {
         setError(res.error);
         return;
@@ -108,7 +108,7 @@ export function OnboardingWizard() {
       // Pull live Stripe state (and a fresh link) if an account already exists.
       if (resume.stripeAccountId) {
         startTransition(async () => {
-          const stripeRes = await refreshStripeStatus({ companyId: resume.id });
+          const stripeRes = await refreshStripeStatus(slug, { companyId: resume.id });
           if (stripeRes.ok) {
             setStripe(stripeRes.data);
             setStripeCheckedAt(new Date().toLocaleTimeString());
@@ -120,7 +120,7 @@ export function OnboardingWizard() {
 
   function submitCompany(data: CompanyInput, force: boolean) {
     run(async () => {
-      const res = await createCompany({
+      const res = await createCompany(slug, {
         name: data.name,
         platformFeePercent: data.platformFeePercent,
         baseFare: data.baseFare,
@@ -281,7 +281,7 @@ export function OnboardingWizard() {
               e.preventDefault();
               const f = new FormData(e.currentTarget);
               run(async () => {
-                const res = await createAdmin({
+                const res = await createAdmin(slug, {
                   companyId: companyId!,
                   name: String(f.get("dname")),
                   phone: String(f.get("dphone")),
@@ -328,7 +328,7 @@ export function OnboardingWizard() {
             onSubmit={(e) => {
               e.preventDefault();
               run(async () => {
-                const res = await createDispatchers({
+                const res = await createDispatchers(slug, {
                   companyId: companyId!,
                   dispatchers: dispatcherRows.filter(
                     (d) => d.name.trim() && d.phone.trim(),
@@ -423,7 +423,7 @@ export function OnboardingWizard() {
             onSubmit={(e) => {
               e.preventDefault();
               run(async () => {
-                const res = await addInvites({
+                const res = await addInvites(slug, {
                   companyId: companyId!,
                   drivers: driverRows.filter((d) => d.phone.trim()),
                   createdBy: adminId,
@@ -524,7 +524,7 @@ export function OnboardingWizard() {
                 disabled={pending}
                 onClick={() =>
                   run(async () => {
-                    const res = await startStripeOnboarding({
+                    const res = await startStripeOnboarding(slug, {
                       companyId: companyId!,
                     });
                     if (!res.ok) return setError(res.error);
@@ -559,7 +559,7 @@ export function OnboardingWizard() {
                       disabled={pending}
                       onClick={() =>
                         run(async () => {
-                          const res = await refreshStripeStatus({
+                          const res = await refreshStripeStatus(slug, {
                             companyId: companyId!,
                           });
                           if (!res.ok) return setError(res.error);

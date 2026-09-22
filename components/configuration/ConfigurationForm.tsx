@@ -5,14 +5,14 @@ import {
   getPlatformSettings,
   updatePlatformSettings,
   type PlatformSettings,
-} from "@/app/(app)/configuration/actions";
+} from "@/app/(app)/[slug]/configuration/actions";
 
 const card = "rounded-xl border border-zinc-800 bg-zinc-900/40 p-6";
 const input =
   "w-full rounded-md border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-zinc-100 outline-none focus:border-accent";
 const label = "block text-sm font-medium text-zinc-400";
 
-export function ConfigurationForm() {
+export function ConfigurationForm({ slug }: { slug: string }) {
   const [settings, setSettings] = useState<PlatformSettings | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);

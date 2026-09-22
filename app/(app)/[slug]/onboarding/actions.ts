@@ -3,11 +3,13 @@
 import { headers } from "next/headers";
 import { requirePlatformOwner } from "@/lib/auth/guard";
 import {
-  mgcjSupabase,
-  stripePost,
-  stripeGet,
-  stripeConfigured,
-} from "@/lib/connectors/mgcj";
+  loadSpoke,
+  spokeSupabase,
+  spokeStripePost,
+  spokeStripeGet,
+  spokeStripeConfigured,
+  type Spoke,
+} from "@/lib/connectors/spoke";
 import { writeAudit } from "@/lib/audit";
 
 export type ActionResult<T> =
@@ -15,7 +17,9 @@ export type ActionResult<T> =
   | { ok: false; error: string; duplicate?: boolean };
 
 // ── Step 1: create company ──────────────────────────────────────────
-export async function createCompany(input: {
+export async function createCompany(
+  slug: string,
+  input: {
   name: string;
   platformFeePercent: number;
   baseFare: number;
@@ -28,7 +32,8 @@ export async function createCompany(input: {
   // Set true to bypass the same-name guard (a genuinely distinct company that
   // happens to share a name with an existing one).
   force?: boolean;
-}): Promise<ActionResult<{ companyId: string; name: string }>> {
+  },
+): Promise<ActionResult<{ companyId: string; name: string }>> {
   const owner = await requirePlatformOwner();
 
   const name = input.name.trim();
@@ -38,7 +43,8 @@ export async function createCompany(input: {
   if (input.baseFare < 0 || input.ratePerKm < 0)
     return { ok: false, error: "Fare values can't be negative." };
 
-  const mgcj = mgcjSupabase();
+  const spoke = await loadSpoke(slug);
+  const mgcj = spokeSupabase(spoke);
 
   // Soft duplicate-name guard. The companies list is the real defence against
   // accidental re-onboarding (resume instead of restart); this just catches a
@@ -83,7 +89,7 @@ export async function createCompany(input: {
 
   await writeAudit({
     actorUserId: owner.id,
-    projectSlug: "mgcj",
+    projectSlug: spoke.slug,
     action: "company.create",
     target: data.id,
     after: { name, platform_fee_percent: input.platformFeePercent },
@@ -100,11 +106,14 @@ export async function createCompany(input: {
 // are 'dispatcher' rows, which the admin themself provisions from the
 // dashboard's own create-staff-account flow, and which this wizard can also
 // optionally seed at onboarding time via createDispatchers.
-export async function createAdmin(input: {
+export async function createAdmin(
+  slug: string,
+  input: {
   companyId: string;
   name: string;
   phone: string;
-}): Promise<ActionResult<{ userId: string }>> {
+  },
+): Promise<ActionResult<{ userId: string }>> {
   const owner = await requirePlatformOwner();
 
   const name = input.name.trim();
@@ -113,7 +122,8 @@ export async function createAdmin(input: {
   if (!/^\+[1-9]\d{7,14}$/.test(phone))
     return { ok: false, error: "Phone must be E.164 format, e.g. +19025551234." };
 
-  const mgcj = mgcjSupabase();
+  const spoke = await loadSpoke(slug);
+  const mgcj = spokeSupabase(spoke);
 
   // Idempotent: if this company already has an admin (e.g. a resumed run, or a
   // step recomputed wrong), return that one instead of trying to create a
@@ -155,7 +165,7 @@ export async function createAdmin(input: {
 
   await writeAudit({
     actorUserId: owner.id,
-    projectSlug: "mgcj",
+    projectSlug: spoke.slug,
     action: "admin.create",
     target: created.user.id,
     after: { company_id: input.companyId, name, phone },
@@ -175,10 +185,13 @@ export async function createAdmin(input: {
 // valid, complete onboarding.
 export type DispatcherResult = { userId: string; name: string; phone: string };
 
-export async function createDispatchers(input: {
+export async function createDispatchers(
+  slug: string,
+  input: {
   companyId: string;
   dispatchers: { name: string; phone: string }[];
-}): Promise<ActionResult<{ created: DispatcherResult[] }>> {
+  },
+): Promise<ActionResult<{ created: DispatcherResult[] }>> {
   const owner = await requirePlatformOwner();
 
   const dispatchers = input.dispatchers
@@ -190,7 +203,8 @@ export async function createDispatchers(input: {
       return { ok: false, error: `Invalid phone: ${d.phone} (use E.164, e.g. +19025551234).` };
   }
 
-  const mgcj = mgcjSupabase();
+  const spoke = await loadSpoke(slug);
+  const mgcj = spokeSupabase(spoke);
   const created: DispatcherResult[] = [];
 
   for (const d of dispatchers) {
@@ -222,7 +236,7 @@ export async function createDispatchers(input: {
 
   await writeAudit({
     actorUserId: owner.id,
-    projectSlug: "mgcj",
+    projectSlug: spoke.slug,
     action: "dispatcher.create",
     target: input.companyId,
     after: { count: created.length, dispatchers: created },
@@ -243,13 +257,16 @@ function genCode() {
 
 export type InviteResult = { code: string; phone: string; name: string | null };
 
-export async function addInvites(input: {
+export async function addInvites(
+  slug: string,
+  input: {
   companyId: string;
   // Each invite is tied to a specific driver phone (driver_invites.phone is NOT
   // NULL and is matched against the phone at driver signup).
   drivers: { name?: string; phone: string }[];
   createdBy?: string | null;
-}): Promise<ActionResult<{ invites: InviteResult[] }>> {
+  },
+): Promise<ActionResult<{ invites: InviteResult[] }>> {
   const owner = await requirePlatformOwner();
 
   const drivers = input.drivers
@@ -262,7 +279,8 @@ export async function addInvites(input: {
       return { ok: false, error: `Invalid phone: ${d.phone} (use E.164, e.g. +19025551234).` };
   }
 
-  const mgcj = mgcjSupabase();
+  const spoke = await loadSpoke(slug);
+  const mgcj = spokeSupabase(spoke);
   const invites: InviteResult[] = [];
 
   for (const d of drivers) {
@@ -291,7 +309,7 @@ export async function addInvites(input: {
 
   await writeAudit({
     actorUserId: owner.id,
-    projectSlug: "mgcj",
+    projectSlug: spoke.slug,
     action: "invites.create",
     target: input.companyId,
     after: { count: invites.length, invites },
@@ -312,15 +330,18 @@ export type StripeStatus = {
 // Mint a fresh Stripe hosted-onboarding link. Account links are single-use and
 // expire quickly, so we always generate a new one at the moment it's needed
 // rather than storing/reusing a stale URL.
-async function mintAccountLink(accountId: string): Promise<string | null> {
+async function mintAccountLink(
+  spoke: Spoke,
+  accountId: string,
+): Promise<string | null> {
   const origin =
     (await headers()).get("origin") ??
     process.env.NEXT_PUBLIC_APP_URL ??
     "http://localhost:3000";
-  const link = await stripePost("/account_links", {
+  const link = await spokeStripePost(spoke, "/account_links", {
     account: accountId,
-    refresh_url: `${origin}/onboarding`,
-    return_url: `${origin}/onboarding`,
+    refresh_url: `${origin}/${spoke.slug}/onboarding`,
+    return_url: `${origin}/${spoke.slug}/onboarding`,
     type: "account_onboarding",
   });
   if (link.error) return null;
@@ -329,14 +350,18 @@ async function mintAccountLink(accountId: string): Promise<string | null> {
 
 // Create the Express account + an onboarding link. Stamps stripe_account_id on
 // the company immediately (stripe_onboarded stays false, so no funds route yet).
-export async function startStripeOnboarding(input: {
+export async function startStripeOnboarding(
+  slug: string,
+  input: {
   companyId: string;
-}): Promise<ActionResult<StripeStatus>> {
+  },
+): Promise<ActionResult<StripeStatus>> {
   const owner = await requirePlatformOwner();
-  if (!stripeConfigured())
+  if (!spokeStripeConfigured(await loadSpoke(slug)))
     return { ok: false, error: "Stripe secret key not configured." };
 
-  const mgcj = mgcjSupabase();
+  const spoke = await loadSpoke(slug);
+  const mgcj = spokeSupabase(spoke);
   const { data: company } = await mgcj
     .from("companies")
     .select("name, stripe_account_id")
@@ -347,7 +372,7 @@ export async function startStripeOnboarding(input: {
   // Reuse an existing account if the step is being re-run.
   let accountId = company.stripe_account_id as string | null;
   if (!accountId) {
-    const acct = await stripePost("/accounts", {
+    const acct = await spokeStripePost(spoke, "/accounts", {
       type: "express",
       country: "CA",
       "capabilities[card_payments][requested]": "true",
@@ -366,14 +391,14 @@ export async function startStripeOnboarding(input: {
 
     await writeAudit({
       actorUserId: owner.id,
-      projectSlug: "mgcj",
+      projectSlug: spoke.slug,
       action: "stripe.account_create",
       target: input.companyId,
       after: { stripe_account_id: accountId },
     });
   }
 
-  const onboardingUrl = await mintAccountLink(accountId!);
+  const onboardingUrl = await mintAccountLink(spoke, accountId!);
   if (!onboardingUrl)
     return { ok: false, error: "Stripe link create failed." };
 
@@ -393,12 +418,16 @@ export async function startStripeOnboarding(input: {
 // are enabled (the gate all three payment functions key off). If it isn't ready
 // yet, mint a *fresh* onboarding link so the caller (Check status, or a resumed
 // run) always has a live link to hand the company — never a blanked-out field.
-export async function refreshStripeStatus(input: {
+export async function refreshStripeStatus(
+  slug: string,
+  input: {
   companyId: string;
-}): Promise<ActionResult<StripeStatus>> {
+  },
+): Promise<ActionResult<StripeStatus>> {
   const owner = await requirePlatformOwner();
 
-  const mgcj = mgcjSupabase();
+  const spoke = await loadSpoke(slug);
+  const mgcj = spokeSupabase(spoke);
   const { data: company } = await mgcj
     .from("companies")
     .select("stripe_account_id, stripe_onboarded")
@@ -407,7 +436,7 @@ export async function refreshStripeStatus(input: {
   if (!company?.stripe_account_id)
     return { ok: false, error: "No Stripe account for this company yet." };
 
-  const acct = await stripeGet(`/accounts/${company.stripe_account_id}`);
+  const acct = await spokeStripeGet(spoke, `/accounts/${company.stripe_account_id}`);
   if (acct.error)
     return { ok: false, error: acct.error.message ?? "Could not load Stripe account." };
 
@@ -419,7 +448,7 @@ export async function refreshStripeStatus(input: {
       .eq("id", input.companyId);
     await writeAudit({
       actorUserId: owner.id,
-      projectSlug: "mgcj",
+      projectSlug: spoke.slug,
       action: "stripe.onboarded",
       target: input.companyId,
       after: { stripe_onboarded: true },
@@ -432,7 +461,7 @@ export async function refreshStripeStatus(input: {
       accountId: company.stripe_account_id,
       onboardingUrl: chargesEnabled
         ? null
-        : await mintAccountLink(company.stripe_account_id),
+        : await mintAccountLink(spoke, company.stripe_account_id),
       chargesEnabled,
       payoutsEnabled: !!acct.payouts_enabled,
       detailsSubmitted: !!acct.details_submitted,
@@ -460,9 +489,12 @@ export type CompanyRow = {
   stripeOnboarded: boolean;
 };
 
-export async function listCompanies(): Promise<ActionResult<CompanyRow[]>> {
+export async function listCompanies(
+  slug: string,
+): Promise<ActionResult<CompanyRow[]>> {
   await requirePlatformOwner();
-  const mgcj = mgcjSupabase();
+  const spoke = await loadSpoke(slug);
+  const mgcj = spokeSupabase(spoke);
 
   const { data: companies, error } = await mgcj
     .from("companies")
@@ -533,10 +565,12 @@ export type CompanyDetail = CompanyRow & {
 };
 
 export async function getCompanyForEdit(
+  slug: string,
   companyId: string,
 ): Promise<ActionResult<CompanyDetail>> {
   await requirePlatformOwner();
-  const mgcj = mgcjSupabase();
+  const spoke = await loadSpoke(slug);
+  const mgcj = spokeSupabase(spoke);
 
   const { data: company, error } = await mgcj
     .from("companies")
@@ -587,7 +621,9 @@ export async function getCompanyForEdit(
   };
 }
 
-export async function updateCompany(input: {
+export async function updateCompany(
+  slug: string,
+  input: {
   companyId: string;
   name: string;
   platformFeePercent: number;
@@ -596,7 +632,8 @@ export async function updateCompany(input: {
   hstNumber?: string;
   billingEmail?: string;
   billingAddress?: string;
-}): Promise<ActionResult<{ companyId: string }>> {
+  },
+): Promise<ActionResult<{ companyId: string }>> {
   const owner = await requirePlatformOwner();
 
   const name = input.name.trim();
@@ -606,7 +643,8 @@ export async function updateCompany(input: {
   if (input.baseFare < 0 || input.ratePerKm < 0)
     return { ok: false, error: "Fare values can't be negative." };
 
-  const mgcj = mgcjSupabase();
+  const spoke = await loadSpoke(slug);
+  const mgcj = spokeSupabase(spoke);
 
   const { data: before } = await mgcj
     .from("companies")
@@ -634,7 +672,7 @@ export async function updateCompany(input: {
 
   await writeAudit({
     actorUserId: owner.id,
-    projectSlug: "mgcj",
+    projectSlug: spoke.slug,
     action: "company.update",
     target: input.companyId,
     before,

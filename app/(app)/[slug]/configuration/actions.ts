@@ -3,7 +3,14 @@
 import { requirePlatformOwner } from "@/lib/auth/guard";
 import { supabaseAdmin } from "@/lib/supabase/admin";
 import { writeAudit } from "@/lib/audit";
-import { mgcjSupabase, stripeGet, stripePost, stripeConfigured } from "@/lib/connectors/mgcj";
+import {
+  loadSpoke,
+  spokeSupabase,
+  spokeStripeGet,
+  spokeStripePost,
+  spokeStripeConfigured,
+  type Spoke,
+} from "@/lib/connectors/spoke";
 
 export type PlatformSettings = {
   legalName: string | null;
@@ -15,6 +22,12 @@ export type PlatformSettings = {
 
 type Result<T> = { ok: true; data: T } | { ok: false; error: string };
 
+// NOTE: platform_settings is HUB-GLOBAL and deliberately takes no slug and no
+// write gate. It holds Vellon's OWN legal name, business/HST numbers and
+// payment instructions — the invoice letterhead — not anything derived from a
+// spoke. Gating it on environment would only stop you editing Vellon's own
+// details while a dev spoke happens to be selected, which protects nothing.
+// This is not a missed Tier 1 gate; do not "fix" it into one.
 export async function getPlatformSettings(): Promise<Result<PlatformSettings>> {
   await requirePlatformOwner();
 
@@ -103,10 +116,13 @@ function clampDays(n: unknown): number | null {
   return v;
 }
 
-export async function getPayoutConfig(): Promise<Result<PayoutConfig>> {
+export async function getPayoutConfig(
+  slug: string,
+): Promise<Result<PayoutConfig>> {
   await requirePlatformOwner();
+  const spoke = await loadSpoke(slug);
 
-  const { data, error } = await mgcjSupabase()
+  const { data, error } = await spokeSupabase(spoke)
     .from("payout_config")
     .select("driver_delay_days, company_delay_days")
     .eq("id", 1)
@@ -127,10 +143,11 @@ export async function getPayoutConfig(): Promise<Result<PayoutConfig>> {
 // target as too low, retry letting Stripe pick its own minimum so the account
 // still lands as fast as allowed rather than erroring. Returns which happened.
 async function applyDelayToAccount(
+  spoke: Spoke,
   accountId: string,
   days: number,
 ): Promise<"updated" | "floored" | "failed"> {
-  const res = await stripePost(`/accounts/${accountId}`, {
+  const res = await spokeStripePost(spoke, `/accounts/${accountId}`, {
     "settings[payouts][schedule][interval]": "daily",
     "settings[payouts][schedule][delay_days]": String(days),
   });
@@ -138,7 +155,7 @@ async function applyDelayToAccount(
 
   if (String(res.error?.param ?? "").includes("delay_days")) {
     // Below the country floor — set interval only, let Stripe apply its min.
-    const retry = await stripePost(`/accounts/${accountId}`, {
+    const retry = await spokeStripePost(spoke, `/accounts/${accountId}`, {
       "settings[payouts][schedule][interval]": "daily",
     });
     return retry.error ? "failed" : "floored";
@@ -147,6 +164,7 @@ async function applyDelayToAccount(
 }
 
 async function pushDelaysToStripe(
+  spoke: Spoke,
   cfg: PayoutConfig,
 ): Promise<PayoutPushSummary> {
   const summary: PayoutPushSummary = {
@@ -156,7 +174,7 @@ async function pushDelaysToStripe(
     skipped: false,
   };
 
-  if (!stripeConfigured()) {
+  if (!spokeStripeConfigured(spoke)) {
     summary.skipped = true;
     return summary;
   }
@@ -166,7 +184,7 @@ async function pushDelaysToStripe(
   for (let page = 0; page < 20; page++) {
     const qs = new URLSearchParams({ limit: "100" });
     if (startingAfter) qs.set("starting_after", startingAfter);
-    const list = await stripeGet(`/accounts?${qs.toString()}`);
+    const list = await spokeStripeGet(spoke, `/accounts?${qs.toString()}`);
     if (list.error || !Array.isArray(list.data)) break;
 
     for (const acct of list.data) {
@@ -174,7 +192,7 @@ async function pushDelaysToStripe(
       // creation (see create-connect-account); a company account isn't.
       const isDriver = Boolean(acct?.metadata?.supabase_user_id);
       const days = isDriver ? cfg.driverDelayDays : cfg.companyDelayDays;
-      const outcome = await applyDelayToAccount(acct.id, days);
+      const outcome = await applyDelayToAccount(spoke, acct.id, days);
       if (outcome === "updated") summary.updated++;
       else if (outcome === "floored") summary.flooredToStripeMin++;
       else summary.failed++;
@@ -188,9 +206,11 @@ async function pushDelaysToStripe(
 }
 
 export async function updatePayoutConfig(
+  slug: string,
   input: PayoutConfig,
 ): Promise<Result<{ config: PayoutConfig; push: PayoutPushSummary }>> {
   const owner = await requirePlatformOwner();
+  const spoke = await loadSpoke(slug);
 
   const driverDelayDays = clampDays(input.driverDelayDays);
   const companyDelayDays = clampDays(input.companyDelayDays);
@@ -198,7 +218,7 @@ export async function updatePayoutConfig(
     return { ok: false, error: `Delay days must be whole numbers between ${DAYS_MIN} and ${DAYS_MAX}.` };
   }
 
-  const mgcj = mgcjSupabase();
+  const mgcj = spokeSupabase(spoke);
 
   const { data: before } = await mgcj
     .from("payout_config")
@@ -222,10 +242,11 @@ export async function updatePayoutConfig(
   // Push to existing Stripe accounts. A push failure must NOT lose the saved
   // config — it's already persisted above — so we surface it in the summary
   // rather than throwing.
-  const push = await pushDelaysToStripe({ driverDelayDays, companyDelayDays });
+  const push = await pushDelaysToStripe(spoke, { driverDelayDays, companyDelayDays });
 
   await writeAudit({
     actorUserId: owner.id,
+    projectSlug: spoke.slug,
     action: "payout_config.update",
     target: "payout_config",
     before,

@@ -16,6 +16,7 @@ export type ProjectRow = {
   color: string | null;
   status: string;
   dashboardUrl: string | null;
+  environment: "prod" | "dev";
 };
 
 function dashboardUrlFrom(links: unknown): string | null {
@@ -29,7 +30,7 @@ export async function listProjects(): Promise<ActionResult<ProjectRow[]>> {
 
   const { data, error } = await supabaseAdmin
     .from("projects")
-    .select("id, name, slug, icon, color, status, links")
+    .select("id, name, slug, icon, color, status, links, environment")
     .order("name", { ascending: true });
   if (error) return { ok: false, error: error.message };
 
@@ -43,6 +44,7 @@ export async function listProjects(): Promise<ActionResult<ProjectRow[]>> {
       color: p.color,
       status: p.status,
       dashboardUrl: dashboardUrlFrom(p.links),
+      environment: (p.environment ?? "prod") as "prod" | "dev",
     })),
   };
 }

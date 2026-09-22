@@ -1,9 +1,9 @@
 "use server";
 
 import { requirePlatformOwner } from "@/lib/auth/guard";
-import { listCompanies } from "@/app/(app)/onboarding/actions";
-import { getHealth } from "@/app/(app)/health/actions";
-import { getRevenue } from "@/app/(app)/revenue/actions";
+import { listCompanies } from "@/app/(app)/[slug]/onboarding/actions";
+import { getHealth } from "@/app/(app)/[slug]/health/actions";
+import { getRevenue } from "@/app/(app)/[slug]/revenue/actions";
 
 // UTC month bounds (match the revenue RPC's bucketing).
 function thisMonthRange() {
@@ -72,19 +72,19 @@ export type Overview = {
   }[];
 };
 
-export async function getOverview(): Promise<
-  { ok: true; data: Overview } | { ok: false; error: string }
-> {
+export async function getOverview(
+  slug: string,
+): Promise<{ ok: true; data: Overview } | { ok: false; error: string }> {
   await requirePlatformOwner();
 
   const { fromISO: mFrom, toISO: mTo } = thisMonthRange();
   const { fromISO: sFrom, toISO: sTo } = sixMonthRange();
 
   const [companiesRes, healthRes, revMonthRes, revSixRes] = await Promise.all([
-    listCompanies(),
-    getHealth(),
-    getRevenue({ fromISO: mFrom, toISO: mTo }),
-    getRevenue({ fromISO: sFrom, toISO: sTo }),
+    listCompanies(slug),
+    getHealth(slug),
+    getRevenue(slug, { fromISO: mFrom, toISO: mTo }),
+    getRevenue(slug, { fromISO: sFrom, toISO: sTo }),
   ]);
 
   if (!companiesRes.ok) return { ok: false, error: companiesRes.error };

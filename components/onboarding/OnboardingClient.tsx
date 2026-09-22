@@ -3,12 +3,12 @@
 import { Suspense } from "react";
 import { OnboardingWizard } from "./OnboardingWizard";
 
-export function OnboardingClient() {
+export function OnboardingClient({ slug }: { slug: string }) {
   // OnboardingWizard reads the ?resume= search param, which requires a
   // Suspense boundary per Next's app-router rules for useSearchParams.
   return (
     <Suspense fallback={null}>
-      <OnboardingWizard />
+      <OnboardingWizard slug={slug} />
     </Suspense>
   );
 }

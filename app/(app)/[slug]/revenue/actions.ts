@@ -1,10 +1,20 @@
 "use server";
 
 import { requirePlatformOwner } from "@/lib/auth/guard";
-import { mgcjSupabase, stripeGet, stripePost, stripeConfigured } from "@/lib/connectors/mgcj";
+import {
+  loadSpoke,
+  spokeSupabase,
+  spokeStripeGet,
+  spokeStripePost,
+  spokeStripeConfigured,
+  assertHubWritable,
+  assertEmailAllowed,
+  SpokeWriteBlocked,
+  type Spoke,
+} from "@/lib/connectors/spoke";
 import { supabaseAdmin } from "@/lib/supabase/admin";
 import { writeAudit } from "@/lib/audit";
-import { getPlatformSettings } from "@/app/(app)/configuration/actions";
+import { getPlatformSettings } from "@/app/(app)/[slug]/configuration/actions";
 import { buildInvoicePdf } from "@/lib/pdf/invoice";
 import { buildInvoiceEmailHtml } from "@/lib/email/invoiceEmail";
 
@@ -82,8 +92,18 @@ export type RevenueSummary = {
   byMonth: { month: string; cardFee: number; cashFee: number; totalFee: number }[];
 };
 
-async function fetchRevRows(fromISO: string, toISO: string): Promise<RevRow[]> {
-  const mgcj = mgcjSupabase();
+// Turns a gate refusal into the same { ok: false } shape every caller already
+// renders. A blocked write is an expected outcome on a dev spoke, not a crash.
+function blocked(e: unknown): { ok: false; error: string } | null {
+  return e instanceof SpokeWriteBlocked ? { ok: false, error: e.message } : null;
+}
+
+async function fetchRevRows(
+  spoke: Spoke,
+  fromISO: string,
+  toISO: string,
+): Promise<RevRow[]> {
+  const mgcj = spokeSupabase(spoke);
   const { data, error } = await mgcj.rpc("ops_revenue", {
     p_from: fromISO,
     p_to: toISO,
@@ -128,13 +148,17 @@ function monthBounds(month: string): { start: string; next: string; first: strin
   };
 }
 
-export async function getRevenue(input: {
+export async function getRevenue(
+  slug: string,
+  input: {
   fromISO: string;
   toISO: string;
-}): Promise<{ ok: true; data: RevenueSummary } | { ok: false; error: string }> {
+  },
+): Promise<{ ok: true; data: RevenueSummary } | { ok: false; error: string }> {
   await requirePlatformOwner();
+  const spoke = await loadSpoke(slug);
   try {
-    const rows = await fetchRevRows(input.fromISO, input.toISO);
+    const rows = await fetchRevRows(spoke, input.fromISO, input.toISO);
 
     const totals = { fares: 0, fee: 0, cardFee: 0, cashFee: 0, refunds: 0, rides: 0 };
     const companies = new Map<string, RevenueSummary["byCompany"][number]>();
@@ -308,15 +332,19 @@ const emptyState = (): SettlementReconciliation["byState"] => ({
   other: { amount: 0, rides: 0 },
 });
 
-export async function getSettlementReconciliation(input: {
+export async function getSettlementReconciliation(
+  slug: string,
+  input: {
   fromISO: string;
   toISO: string;
-}): Promise<
+  },
+): Promise<
   { ok: true; data: SettlementReconciliation } | { ok: false; error: string }
 > {
   await requirePlatformOwner();
+  const spoke = await loadSpoke(slug);
   try {
-    const mgcj = mgcjSupabase();
+    const mgcj = spokeSupabase(spoke);
     const { data, error } = await mgcj.rpc("ops_settlement_reconciliation", {
       p_from: input.fromISO,
       p_to: input.toISO,
@@ -440,14 +468,18 @@ export type Invoice = {
   pdf_path: string | null;
 };
 
-export async function listInvoices(input: {
+export async function listInvoices(
+  slug: string,
+  input: {
   month?: string; // 'YYYY-MM'
-}): Promise<{ ok: true; data: Invoice[] } | { ok: false; error: string }> {
+  },
+): Promise<{ ok: true; data: Invoice[] } | { ok: false; error: string }> {
   await requirePlatformOwner();
+  const spoke = await loadSpoke(slug);
   let q = supabaseAdmin
     .from("invoices")
     .select("*")
-    .eq("project_slug", "mgcj")
+    .eq("project_slug", spoke.slug)
     .order("period_month", { ascending: false })
     .order("company_name", { ascending: true });
   if (input.month) q = q.eq("period_month", monthBounds(input.month).first);
@@ -458,15 +490,30 @@ export async function listInvoices(input: {
 
 // Generate/refresh DRAFT cash invoices for a month from live mgcj data.
 // Never overwrites an invoice already marked sent/paid (those are locked).
-export async function generateInvoices(input: {
+export async function generateInvoices(
+  slug: string,
+  input: {
   month: string; // 'YYYY-MM'
-}): Promise<{ ok: true; data: Invoice[] } | { ok: false; error: string }> {
+  },
+): Promise<{ ok: true; data: Invoice[] } | { ok: false; error: string }> {
   const owner = await requirePlatformOwner();
+  const spoke = await loadSpoke(slug);
+  // The hub is ONE Supabase project across local/Preview/Production, so these
+  // rows land in the same table production bills from, regardless of spoke.
+  // Dev mgcj is a restored copy full of real-looking rides — ungated, this
+  // generates real invoices from fake data.
+  try {
+    assertHubWritable(spoke, "Generating invoices");
+  } catch (e) {
+    const b = blocked(e);
+    if (b) return b;
+    throw e;
+  }
   const { start, next, first } = monthBounds(input.month);
 
   let rows: RevRow[];
   try {
-    rows = await fetchRevRows(start, next);
+    rows = await fetchRevRows(spoke, start, next);
   } catch (e) {
     return { ok: false, error: (e as Error).message };
   }
@@ -494,7 +541,7 @@ export async function generateInvoices(input: {
   const { data: existing } = await supabaseAdmin
     .from("invoices")
     .select("company_id, status")
-    .eq("project_slug", "mgcj")
+    .eq("project_slug", spoke.slug)
     .eq("period_month", first);
   const locked = new Set(
     (existing ?? [])
@@ -511,7 +558,7 @@ export async function generateInvoices(input: {
   const toUpsert = [...perCompany.entries()]
     .filter(([companyId, e]) => e.fares > 0 && !locked.has(companyId))
     .map(([companyId, e]) => ({
-      project_slug: "mgcj",
+      project_slug: spoke.slug,
       company_id: companyId,
       company_name: e.name,
       period_month: first,
@@ -536,21 +583,32 @@ export async function generateInvoices(input: {
     if (error) return { ok: false, error: error.message };
     await writeAudit({
       actorUserId: owner.id,
-      projectSlug: "mgcj",
+      projectSlug: spoke.slug,
       action: "invoices.generate",
       target: first,
       after: { month: input.month, count: toUpsert.length },
     });
   }
 
-  return listInvoices({ month: input.month });
+  return listInvoices(slug, { month: input.month });
 }
 
-export async function updateInvoiceStatus(input: {
+export async function updateInvoiceStatus(
+  slug: string,
+  input: {
   id: string;
   status: "draft" | "sent" | "paid" | "void";
-}): Promise<{ ok: true } | { ok: false; error: string }> {
+  },
+): Promise<{ ok: true } | { ok: false; error: string }> {
   const owner = await requirePlatformOwner();
+  const spoke = await loadSpoke(slug);
+  try {
+    assertHubWritable(spoke, "Changing an invoice's status");
+  } catch (e) {
+    const b = blocked(e);
+    if (b) return b;
+    throw e;
+  }
   const patch: Record<string, unknown> = { status: input.status };
   if (input.status === "sent") patch.sent_at = new Date().toISOString();
   if (input.status === "paid") patch.paid_at = new Date().toISOString();
@@ -563,7 +621,7 @@ export async function updateInvoiceStatus(input: {
 
   await writeAudit({
     actorUserId: owner.id,
-    projectSlug: "mgcj",
+    projectSlug: spoke.slug,
     action: "invoice.status",
     target: input.id,
     after: { status: input.status },
@@ -593,6 +651,7 @@ type BuiltInvoicePdf = {
 // the manual-delivery path both need to work for companies that don't have
 // one yet.
 async function buildAndStoreInvoicePdf(
+  spoke: Spoke,
   invoiceId: string,
 ): Promise<{ ok: true; data: BuiltInvoicePdf } | { ok: false; error: string }> {
   const { data: invoice, error: invErr } = await supabaseAdmin
@@ -605,7 +664,7 @@ async function buildAndStoreInvoicePdf(
   if (invErr) return { ok: false, error: invErr.message };
   if (!invoice) return { ok: false, error: "Invoice not found." };
 
-  const mgcj = mgcjSupabase();
+  const mgcj = spokeSupabase(spoke);
   const { data: company, error: companyErr } = await mgcj
     .from("companies")
     .select("billing_email, billing_address")
@@ -678,23 +737,43 @@ async function buildAndStoreInvoicePdf(
 // Generate/refresh the PDF and return a signed download URL — used for the
 // "Preview / Download PDF" button, before or instead of sending. Same builder
 // sendInvoice uses, just without emailing or touching status.
-export async function previewInvoicePdf(input: {
+export async function previewInvoicePdf(
+  slug: string,
+  input: {
   id: string;
-}): Promise<{ ok: true; url: string } | { ok: false; error: string }> {
+  },
+): Promise<{ ok: true; url: string } | { ok: false; error: string }> {
   await requirePlatformOwner();
-  const built = await buildAndStoreInvoicePdf(input.id);
+  const spoke = await loadSpoke(slug);
+  const built = await buildAndStoreInvoicePdf(spoke, input.id);
   if (!built.ok) return built;
-  return getInvoicePdfUrl({ pdfPath: built.data.pdfPath });
+  return getInvoicePdfUrl(slug, { pdfPath: built.data.pdfPath });
 }
 
 // Generate the PDF and email it to the company's billing contact, then flip
 // the invoice to sent.
-export async function sendInvoice(input: {
+export async function sendInvoice(
+  slug: string,
+  input: {
   id: string;
-}): Promise<{ ok: true } | { ok: false; error: string }> {
+  },
+): Promise<{ ok: true } | { ok: false; error: string }> {
   const owner = await requirePlatformOwner();
+  const spoke = await loadSpoke(slug);
+  // RESEND_API_KEY is the LIVE key in every environment and Resend has no test
+  // mode, so this gate is the only thing between a dev spoke and a real
+  // invoice landing in a real company's inbox. It also flips the invoice to
+  // `sent`, which locks it — a hub write in its own right.
+  try {
+    assertEmailAllowed(spoke, "Sending an invoice");
+    assertHubWritable(spoke, "Sending an invoice");
+  } catch (e) {
+    const b = blocked(e);
+    if (b) return b;
+    throw e;
+  }
 
-  const built = await buildAndStoreInvoicePdf(input.id);
+  const built = await buildAndStoreInvoicePdf(spoke, input.id);
   if (!built.ok) return built;
   const {
     pdfBytes,
@@ -759,7 +838,7 @@ export async function sendInvoice(input: {
 
   await writeAudit({
     actorUserId: owner.id,
-    projectSlug: "mgcj",
+    projectSlug: spoke.slug,
     action: "invoice.send",
     target: input.id,
     after: { billing_email: billingEmail, pdf_path: pdfPath },
@@ -768,10 +847,14 @@ export async function sendInvoice(input: {
   return { ok: true };
 }
 
-export async function getInvoicePdfUrl(input: {
+export async function getInvoicePdfUrl(
+  slug: string,
+  input: {
   pdfPath: string;
-}): Promise<{ ok: true; url: string } | { ok: false; error: string }> {
+  },
+): Promise<{ ok: true; url: string } | { ok: false; error: string }> {
   await requirePlatformOwner();
+  const spoke = await loadSpoke(slug);
   const { data, error } = await supabaseAdmin.storage
     .from("invoices")
     .createSignedUrl(input.pdfPath, 60 * 10); // 10 min
@@ -810,11 +893,23 @@ const CLOSED_STATUSES = new Set(["won", "lost", "warning_closed", "charge_refund
 // mgcj connector, and upsert into the hub. Idempotent — safe to run repeatedly.
 // Disputes already recorded as closed are skipped (frozen), so a re-sync only
 // ever touches still-open ones.
-export async function syncDisputeCosts(): Promise<
+export async function syncDisputeCosts(
+  slug: string,
+): Promise<
   { ok: true; synced: number; skipped: number } | { ok: false; error: string }
 > {
   const owner = await requirePlatformOwner();
-  if (!stripeConfigured()) {
+  const spoke = await loadSpoke(slug);
+  // This is the exact write that put four sandbox disputes into the hub on
+  // 2026-09-22, two of them closed and therefore frozen against any re-sync.
+  try {
+    assertHubWritable(spoke, "Syncing dispute costs");
+  } catch (e) {
+    const b = blocked(e);
+    if (b) return b;
+    throw e;
+  }
+  if (!spokeStripeConfigured(spoke)) {
     return { ok: false, error: "Stripe not configured (MGCJ_STRIPE_SECRET missing)." };
   }
 
@@ -823,7 +918,7 @@ export async function syncDisputeCosts(): Promise<
     const { data: frozenRows, error: frozenErr } = await supabaseAdmin
       .from("dispute_costs")
       .select("stripe_dispute_id")
-      .eq("project_slug", "mgcj")
+      .eq("project_slug", spoke.slug)
       .eq("is_closed", true);
     if (frozenErr) {
       return { ok: false, error: missingDisputeMigrationMsg(frozenErr) ?? frozenErr.message };
@@ -839,7 +934,7 @@ export async function syncDisputeCosts(): Promise<
       qs.append("expand[]", "data.charge.balance_transaction");
       if (startingAfter) qs.set("starting_after", startingAfter);
 
-      const res = await stripeGet(`/disputes?${qs.toString()}`);
+      const res = await spokeStripeGet(spoke, `/disputes?${qs.toString()}`);
       if (res.error) return { ok: false, error: `Stripe: ${res.error.message}` };
       disputes.push(...(res.data as StripeDispute[]));
       if (!res.has_more || res.data.length === 0) break;
@@ -859,7 +954,7 @@ export async function syncDisputeCosts(): Promise<
     const companyNames = new Map<string, string>();
 
     if (piIds.length > 0) {
-      const mgcj = mgcjSupabase();
+      const mgcj = spokeSupabase(spoke);
       const { data: rides, error: ridesErr } = await mgcj
         .from("rides")
         .select("id, company_id, stripe_payment_intent_id")
@@ -931,7 +1026,7 @@ export async function syncDisputeCosts(): Promise<
       const netCost = disputeFee + (isWon ? 0 : processingFee);
 
       return {
-        project_slug: "mgcj",
+        project_slug: spoke.slug,
         stripe_dispute_id: d.id,
         charge_id: idOf(d.charge),
         payment_intent_id: piId,
@@ -963,7 +1058,7 @@ export async function syncDisputeCosts(): Promise<
 
     await writeAudit({
       actorUserId: owner.id,
-      projectSlug: "mgcj",
+      projectSlug: spoke.slug,
       action: "disputes.sync",
       target: "stripe",
       after: { synced: rows.length, skipped: disputes.length - rows.length },
@@ -1003,11 +1098,15 @@ export type DisputeCosts = {
 };
 
 // Bucketed by opened_at — when the money actually left Vellon's balance.
-export async function getDisputeCosts(input: {
+export async function getDisputeCosts(
+  slug: string,
+  input: {
   fromISO: string;
   toISO: string;
-}): Promise<{ ok: true; data: DisputeCosts } | { ok: false; error: string }> {
+  },
+): Promise<{ ok: true; data: DisputeCosts } | { ok: false; error: string }> {
   await requirePlatformOwner();
+  const spoke = await loadSpoke(slug);
 
   // Currency-scoped: totals below sum cents across rows, which would be
   // meaningless if a non-CAD dispute ever landed. Filtering rather than
@@ -1016,7 +1115,7 @@ export async function getDisputeCosts(input: {
   const { data, error } = await supabaseAdmin
     .from("dispute_costs")
     .select("*")
-    .eq("project_slug", "mgcj")
+    .eq("project_slug", spoke.slug)
     .eq("currency", "cad")
     .gte("opened_at", input.fromISO)
     .lt("opened_at", input.toISO)
@@ -1100,12 +1199,15 @@ export type StrandedSettlements = {
   }[];
 };
 
-export async function getStrandedSettlements(): Promise<
+export async function getStrandedSettlements(
+  slug: string,
+): Promise<
   { ok: true; data: StrandedSettlements } | { ok: false; error: string }
 > {
   await requirePlatformOwner();
+  const spoke = await loadSpoke(slug);
   try {
-    const mgcj = mgcjSupabase();
+    const mgcj = spokeSupabase(spoke);
     const { data, error } = await mgcj
       .from("rides")
       .select("id, company_id, settlement_route, transfer_amount_cents, refunded_amount_cents")
@@ -1223,12 +1325,16 @@ export type RefundableRide = {
 // Find a passenger's completed card rides by phone, newest first, annotated with
 // whether each can still be refunded. Phone match is a loose suffix contains —
 // operators paste whatever format the passenger gave them.
-export async function searchRefundableRides(input: {
+export async function searchRefundableRides(
+  slug: string,
+  input: {
   phone: string;
-}): Promise<{ ok: true; data: RefundableRide[] } | { ok: false; error: string }> {
+  },
+): Promise<{ ok: true; data: RefundableRide[] } | { ok: false; error: string }> {
   await requirePlatformOwner();
+  const spoke = await loadSpoke(slug);
   try {
-    if (!stripeConfigured()) {
+    if (!spokeStripeConfigured(spoke)) {
       return { ok: false, error: "Stripe is not configured (MGCJ_STRIPE_SECRET)." };
     }
     const digits = input.phone.replace(/[^0-9]/g, "");
@@ -1236,7 +1342,7 @@ export async function searchRefundableRides(input: {
       return { ok: false, error: "Enter at least 4 digits of the passenger's phone." };
     }
 
-    const mgcj = mgcjSupabase();
+    const mgcj = spokeSupabase(spoke);
 
     // Passengers whose phone contains the entered digits.
     const { data: passengers, error: pErr } = await mgcj
@@ -1314,23 +1420,27 @@ export async function searchRefundableRides(input: {
   }
 }
 
-export async function refundRide(input: {
+export async function refundRide(
+  slug: string,
+  input: {
   rideId: string;
   amountCents?: number; // omit for a full refund of the remaining balance
   reason: RefundReason;
-}): Promise<
+  },
+): Promise<
   | { ok: true; refundId: string; amountCents: number; clawback: boolean }
   | { ok: false; error: string }
 > {
   const owner = await requirePlatformOwner();
+  const spoke = await loadSpoke(slug);
   try {
-    if (!stripeConfigured()) {
+    if (!spokeStripeConfigured(spoke)) {
       return { ok: false, error: "Stripe is not configured (MGCJ_STRIPE_SECRET)." };
     }
     const absorbedBy = REFUND_ABSORBED_BY[input.reason];
     if (!absorbedBy) return { ok: false, error: "Unknown refund reason." };
 
-    const mgcj = mgcjSupabase();
+    const mgcj = spokeSupabase(spoke);
     const { data: ride, error: rErr } = await mgcj
       .from("rides")
       .select(
@@ -1367,7 +1477,8 @@ export async function refundRide(input: {
     // idempotency key folds in the prior-refunded total so a genuine second
     // partial isn't collapsed into the first, but a double-submit of the SAME
     // partial is.
-    const refund = await stripePost(
+    const refund = await spokeStripePost(
+      spoke,
       "/refunds",
       {
         payment_intent: ride.stripe_payment_intent_id,
@@ -1400,7 +1511,7 @@ export async function refundRide(input: {
 
     await writeAudit({
       actorUserId: owner.id,
-      projectSlug: "mgcj",
+      projectSlug: spoke.slug,
       action: "ride.refund",
       target: ride.id,
       after: {
@@ -1498,13 +1609,17 @@ export type RefundsByReason = {
   }[];
 };
 
-export async function getRefundsByReason(input: {
+export async function getRefundsByReason(
+  slug: string,
+  input: {
   fromISO: string;
   toISO: string;
-}): Promise<{ ok: true; data: RefundsByReason } | { ok: false; error: string }> {
+  },
+): Promise<{ ok: true; data: RefundsByReason } | { ok: false; error: string }> {
   await requirePlatformOwner();
+  const spoke = await loadSpoke(slug);
   try {
-    const mgcj = mgcjSupabase();
+    const mgcj = spokeSupabase(spoke);
     const { data, error } = await mgcj
       .from("rides")
       .select(
@@ -1646,10 +1761,13 @@ export async function getRefundsByReason(input: {
 //      instead of re-verifying, so there's one auth check, not five.
 // Invoices (their own month selector) and the refund search (interactive)
 // stay separate on purpose.
-export async function getRevenueOverview(input: {
+export async function getRevenueOverview(
+  slug: string,
+  input: {
   fromISO: string;
   toISO: string;
-}): Promise<{
+  },
+): Promise<{
   revenue: Awaited<ReturnType<typeof getRevenue>>;
   settlement: Awaited<ReturnType<typeof getSettlementReconciliation>>;
   disputeCosts: Awaited<ReturnType<typeof getDisputeCosts>>;
@@ -1659,11 +1777,11 @@ export async function getRevenueOverview(input: {
   await requirePlatformOwner();
   const [revenue, settlement, disputeCosts, stranded, refunds] =
     await Promise.all([
-      getRevenue(input),
-      getSettlementReconciliation(input),
-      getDisputeCosts(input),
-      getStrandedSettlements(),
-      getRefundsByReason(input),
+      getRevenue(slug, input),
+      getSettlementReconciliation(slug, input),
+      getDisputeCosts(slug, input),
+      getStrandedSettlements(slug),
+      getRefundsByReason(slug, input),
     ]);
   return { revenue, settlement, disputeCosts, stranded, refunds };
 }

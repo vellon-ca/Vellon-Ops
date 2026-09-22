@@ -1,7 +1,7 @@
 "use server";
 
 import { requirePlatformOwner } from "@/lib/auth/guard";
-import { mgcjSupabase } from "@/lib/connectors/mgcj";
+import { loadSpoke, spokeSupabase } from "@/lib/connectors/spoke";
 import { writeAudit } from "@/lib/audit";
 
 export type ActionResult<T> =
@@ -45,9 +45,10 @@ export type Reports = {
 // Both tables are email-only at the source (Resend, on insert) — this is the
 // only queryable view of either. technical_reports' RLS only lets a reporter
 // read their own rows, so both reads go through the service-role connector.
-export async function getReports(): Promise<ActionResult<Reports>> {
+export async function getReports(slug: string): Promise<ActionResult<Reports>> {
   await requirePlatformOwner();
-  const mgcj = mgcjSupabase();
+  const spoke = await loadSpoke(slug);
+  const mgcj = spokeSupabase(spoke);
 
   const [{ data: dispatchRows, error: dErr }, { data: technicalRows, error: tErr }] =
     await Promise.all([
@@ -116,12 +117,18 @@ export async function getReports(): Promise<ActionResult<Reports>> {
   return { ok: true, data: { dispatch, technical } };
 }
 
-export async function resolveReport(input: {
-  source: "dispatch" | "technical";
-  id: string;
-}): Promise<ActionResult<{ id: string }>> {
+export async function resolveReport(
+  slug: string,
+  input: {
+    source: "dispatch" | "technical";
+    id: string;
+  },
+): Promise<ActionResult<{ id: string }>> {
   const owner = await requirePlatformOwner();
-  const mgcj = mgcjSupabase();
+  const spoke = await loadSpoke(slug);
+  // Resolving a report writes only to the spoke's own tables — allowed on a
+  // dev spoke, since exercising the console against dev data is the point.
+  const mgcj = spokeSupabase(spoke);
   const table = input.source === "dispatch" ? "dispatch_reports" : "technical_reports";
 
   const { data: before } = await mgcj
@@ -140,7 +147,7 @@ export async function resolveReport(input: {
 
   await writeAudit({
     actorUserId: owner.id,
-    projectSlug: "mgcj",
+    projectSlug: spoke.slug,
     action: `${input.source}_report.resolve`,
     target: input.id,
     before: { status: before.status },

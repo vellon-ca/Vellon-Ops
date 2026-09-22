@@ -7,7 +7,7 @@ import {
   type DispatchReport,
   type Reports,
   type TechnicalReport,
-} from "@/app/(app)/reports/actions";
+} from "@/app/(app)/[slug]/reports/actions";
 
 type Tab = "dispatch" | "technical";
 type Selected =
@@ -46,7 +46,7 @@ function StatusBadge({ status }: { status: "open" | "resolved" }) {
   );
 }
 
-export function ReportsDashboard() {
+export function ReportsDashboard({ slug }: { slug: string }) {
   const [reports, setReports] = useState<Reports | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>("dispatch");
@@ -56,7 +56,7 @@ export function ReportsDashboard() {
 
   const load = useCallback(() => {
     startTransition(async () => {
-      const res = await getReports();
+      const res = await getReports(slug);
       if (res.ok) {
         setReports(res.data);
         setError(null);
@@ -73,7 +73,7 @@ export function ReportsDashboard() {
   const resolve = (source: Tab, id: string) => {
     setResolvingId(id);
     startTransition(async () => {
-      const res = await resolveReport({ source, id });
+      const res = await resolveReport(slug, { source, id });
       if (res.ok) {
         load();
         setSelected(null);
