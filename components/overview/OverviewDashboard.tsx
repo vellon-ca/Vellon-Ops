@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState, useTransition } from "react";
 import Link from "next/link";
-import { getOverview, type Overview } from "@/app/(app)/overview/actions";
+import { getOverview, type Overview } from "@/app/(app)/[slug]/overview/actions";
 
 const cad = (n: number) =>
   new Intl.NumberFormat("en-CA", {
@@ -57,20 +57,20 @@ const STATUS_PILL: Record<Overview["portfolio"][number]["onboardStatus"], { text
   fully_ready: { text: "Fully ready", cls: "border-emerald-900/40 bg-emerald-950/30 text-emerald-300" },
 };
 
-export function OverviewDashboard() {
+export function OverviewDashboard({ slug }: { slug: string }) {
   const [ov, setOv] = useState<Overview | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [pending, startTransition] = useTransition();
 
   const load = useCallback(() => {
     startTransition(async () => {
-      const res = await getOverview();
+      const res = await getOverview(slug);
       if (res.ok) {
         setOv(res.data);
         setError(null);
       } else setError(res.error);
     });
-  }, []);
+  }, [slug]);
 
   useEffect(() => {
     load();
@@ -121,7 +121,7 @@ export function OverviewDashboard() {
           {/* ── Headline tiles ── */}
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
             {/* Companies */}
-            <Link href="/companies" className={tile}>
+            <Link href={`/${slug}/companies`} className={tile}>
               <p className="text-sm text-zinc-400">Companies</p>
               <p className="mt-2 text-3xl font-semibold text-zinc-100">
                 {ov.companies.total}
@@ -138,7 +138,7 @@ export function OverviewDashboard() {
             </Link>
 
             {/* Revenue MTD */}
-            <Link href="/revenue" className={tile}>
+            <Link href={`/${slug}/revenue`} className={tile}>
               <div className="flex items-start justify-between">
                 <p className="text-sm text-zinc-400">Platform fees (MTD)</p>
                 {ov.revenue.available && <Sparkline points={ov.revenue.spark.map((s) => s.fee)} />}
@@ -168,7 +168,7 @@ export function OverviewDashboard() {
             </Link>
 
             {/* Ops health */}
-            <Link href="/health" className={tile}>
+            <Link href={`/${slug}/health`} className={tile}>
               <p className="text-sm text-zinc-400">Ops health</p>
               <p className={"mt-2 text-3xl font-semibold " + healthTone}>
                 {ov.health.status === "ok"
@@ -199,7 +199,7 @@ export function OverviewDashboard() {
                     <span className="text-zinc-300">{a.name}</span>
                     <span className="flex items-center gap-3">
                       <span className="text-amber-300/80">{a.issue}</span>
-                      <Link href="/companies" className="text-xs text-accent hover:text-accent-hover">
+                      <Link href={`/${slug}/companies`} className="text-xs text-accent hover:text-accent-hover">
                         Resume →
                       </Link>
                     </span>
@@ -227,7 +227,7 @@ export function OverviewDashboard() {
                   {ov.portfolio.length === 0 && (
                     <tr>
                       <td colSpan={5} className="px-4 py-6 text-center text-zinc-500">
-                        No companies yet. <Link href="/onboarding" className="text-accent">Onboard one →</Link>
+                        No companies yet. <Link href={`/${slug}/onboarding`} className="text-accent">Onboard one →</Link>
                       </td>
                     </tr>
                   )}

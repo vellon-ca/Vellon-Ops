@@ -5,7 +5,7 @@ import {
   getHealth,
   type Health,
   type CronJob,
-} from "@/app/(app)/health/actions";
+} from "@/app/(app)/[slug]/health/actions";
 
 const card = "rounded-xl border border-zinc-800 bg-zinc-900/40 p-4";
 const muted = "text-xs text-zinc-500";
@@ -65,7 +65,7 @@ function Stat({
   );
 }
 
-export function HealthDashboard() {
+export function HealthDashboard({ slug }: { slug: string }) {
   const [health, setHealth] = useState<Health | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [auto, setAuto] = useState(true);
@@ -74,7 +74,7 @@ export function HealthDashboard() {
 
   const load = useCallback(() => {
     startTransition(async () => {
-      const res = await getHealth();
+      const res = await getHealth(slug);
       if (res.ok) {
         setHealth(res.data);
         setError(null);

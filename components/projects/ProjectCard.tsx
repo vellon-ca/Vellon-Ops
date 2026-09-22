@@ -157,7 +157,10 @@ export function ProjectCard({ project }: { project: ProjectRow }) {
         </svg>
       </button>
 
-      <Link href="/overview" className="flex items-center gap-3 pr-6">
+      <Link
+        href={`/${project.slug}/overview`}
+        className="flex items-center gap-3 pr-6"
+      >
         <div
           className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-lg"
           style={{ backgroundColor: project.color || DEFAULT_COLOR }}
@@ -173,6 +176,14 @@ export function ProjectCard({ project }: { project: ProjectRow }) {
       </Link>
 
       <div className="mt-3 flex items-center gap-3">
+        {/* A dev spoke reads a different customer database. Its revenue and
+            ride counts look exactly as real as prod's, so the distinction has
+            to be visible before you click in, not only after. */}
+        {project.environment !== "prod" && (
+          <span className="inline-block rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-400">
+            {project.environment}
+          </span>
+        )}
         {project.status !== "active" && (
           <span className="inline-block rounded-full border border-zinc-700 px-2 py-0.5 text-[10px] uppercase tracking-wide text-zinc-500">
             {project.status}

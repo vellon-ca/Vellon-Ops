@@ -6,7 +6,7 @@ import {
   updatePayoutConfig,
   type PayoutConfig,
   type PayoutPushSummary,
-} from "@/app/(app)/configuration/actions";
+} from "@/app/(app)/[slug]/configuration/actions";
 
 const card = "rounded-xl border border-zinc-800 bg-zinc-900/40 p-6";
 const input =
@@ -23,14 +23,14 @@ function pushMessage(p: PayoutPushSummary): string {
   return parts.length ? `Saved. ${parts.join(", ")}.` : "Saved. No existing Stripe accounts to update.";
 }
 
-export function PayoutTimingForm() {
+export function PayoutTimingForm({ slug }: { slug: string }) {
   const [config, setConfig] = useState<PayoutConfig | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [savedMsg, setSavedMsg] = useState<string | null>(null);
   const [pending, startTransition] = useTransition();
 
   useEffect(() => {
-    getPayoutConfig().then((res) => {
+    getPayoutConfig(slug).then((res) => {
       if (res.ok) setConfig(res.data);
       else setError(res.error);
     });
@@ -40,7 +40,7 @@ export function PayoutTimingForm() {
     setError(null);
     setSavedMsg(null);
     startTransition(async () => {
-      const res = await updatePayoutConfig({
+      const res = await updatePayoutConfig(slug, {
         driverDelayDays: Number(f.get("driverDelayDays")),
         companyDelayDays: Number(f.get("companyDelayDays")),
       });

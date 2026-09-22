@@ -1,7 +1,7 @@
 "use server";
 
 import { requirePlatformOwner } from "@/lib/auth/guard";
-import { mgcjSupabase } from "@/lib/connectors/mgcj";
+import { loadSpoke, spokeSupabase } from "@/lib/connectors/spoke";
 
 // ── Types ───────────────────────────────────────────────────────────
 export type Detector = {
@@ -67,11 +67,12 @@ async function runDetector(
   };
 }
 
-export async function getHealth(): Promise<
-  { ok: true; data: Health } | { ok: false; error: string }
-> {
+export async function getHealth(
+  slug: string,
+): Promise<{ ok: true; data: Health } | { ok: false; error: string }> {
   await requirePlatformOwner();
-  const mgcj = mgcjSupabase();
+  const spoke = await loadSpoke(slug);
+  const mgcj = spokeSupabase(spoke);
 
   // ── Row counts (public tables) ────────────────────────────────────
   const countTables = [

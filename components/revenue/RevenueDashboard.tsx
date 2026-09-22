@@ -25,7 +25,7 @@ import {
   type RefundReasonKey,
   type RefundableRide,
   type RefundReason,
-} from "@/app/(app)/revenue/actions";
+} from "@/app/(app)/[slug]/revenue/actions";
 
 // Dark-mode categorical slots 1 (blue) & 2 (aqua) — validated CVD-safe pair.
 const CARD = "#3987e5";
@@ -79,7 +79,7 @@ type DisputeCostsResult = Awaited<ReturnType<typeof getDisputeCosts>>;
 type StrandedResult = Awaited<ReturnType<typeof getStrandedSettlements>>;
 type RefundsResult = Awaited<ReturnType<typeof getRefundsByReason>>;
 
-export function RevenueDashboard() {
+export function RevenueDashboard({ slug }: { slug: string }) {
   const [preset, setPreset] = useState(2); // "6 months"
   const [rev, setRev] = useState<RevenueSummary | null>(null);
   const [settlement, setSettlement] = useState<SettlementResult | null>(null);
@@ -92,7 +92,7 @@ export function RevenueDashboard() {
   const load = useCallback(() => {
     const { fromISO, toISO } = rangeFor(PRESETS[preset].months);
     startTransition(async () => {
-      const res = await getRevenueOverview({ fromISO, toISO });
+      const res = await getRevenueOverview(slug, { fromISO, toISO });
       if (res.revenue.ok) {
         setRev(res.revenue.data);
         setError(null);
@@ -214,12 +214,14 @@ export function RevenueDashboard() {
           </section>
 
           <SettlementSection
+          slug={slug}
             fromISO={rangeFor(PRESETS[preset].months).fromISO}
             toISO={rangeFor(PRESETS[preset].months).toISO}
             preloaded={settlement}
           />
 
           <DisputeSection
+          slug={slug}
             fromISO={rangeFor(PRESETS[preset].months).fromISO}
             toISO={rangeFor(PRESETS[preset].months).toISO}
             preloadedCosts={disputeCosts}
@@ -227,14 +229,15 @@ export function RevenueDashboard() {
           />
 
           <RefundsByReasonSection
+          slug={slug}
             fromISO={rangeFor(PRESETS[preset].months).fromISO}
             toISO={rangeFor(PRESETS[preset].months).toISO}
             preloaded={refunds}
           />
 
-          <RefundSection />
+          <RefundSection slug={slug} />
 
-          <InvoiceSection />
+          <InvoiceSection slug={slug} />
         </div>
       )}
     </div>
@@ -314,10 +317,12 @@ const STATE_ORDER: SettlementState[] = [
 ];
 
 function SettlementSection({
+  slug,
   fromISO,
   toISO,
   preloaded,
 }: {
+  slug: string;
   fromISO: string;
   toISO: string;
   preloaded: SettlementResult | null;
@@ -328,7 +333,7 @@ function SettlementSection({
 
   const load = useCallback(() => {
     startTransition(async () => {
-      const res = await getSettlementReconciliation({ fromISO, toISO });
+      const res = await getSettlementReconciliation(slug, { fromISO, toISO });
       if (res.ok) {
         setData(res.data);
         setError(null);
@@ -532,11 +537,13 @@ function SettlementSection({
 // Vellon's own cost of chargebacks — money that touches no ride's settlement
 // math and is therefore invisible everywhere else on the platform.
 function DisputeSection({
+  slug,
   fromISO,
   toISO,
   preloadedCosts,
   preloadedStranded,
 }: {
+  slug: string;
   fromISO: string;
   toISO: string;
   preloadedCosts: DisputeCostsResult | null;
@@ -551,8 +558,8 @@ function DisputeSection({
   const load = useCallback(() => {
     startTransition(async () => {
       const [c, s] = await Promise.all([
-        getDisputeCosts({ fromISO, toISO }),
-        getStrandedSettlements(),
+        getDisputeCosts(slug, { fromISO, toISO }),
+        getStrandedSettlements(slug),
       ]);
       if (c.ok) setCosts(c.data);
       else setError(c.error);
@@ -577,7 +584,7 @@ function DisputeSection({
 
   const sync = () => {
     startTransition(async () => {
-      const res = await syncDisputeCosts();
+      const res = await syncDisputeCosts(slug);
       if (!res.ok) {
         setError(res.error);
         return;
@@ -980,7 +987,7 @@ const STATUS_STYLE: Record<Invoice["status"], string> = {
   void: "border-zinc-800 bg-zinc-900 text-zinc-600 line-through",
 };
 
-function InvoiceSection() {
+function InvoiceSection({ slug }: { slug: string }) {
   const [month, setMonth] = useState(() => {
     const n = new Date();
     // Default to last completed month.
@@ -993,7 +1000,7 @@ function InvoiceSection() {
 
   const refresh = useCallback((m: string) => {
     startTransition(async () => {
-      const res = await listInvoices({ month: m });
+      const res = await listInvoices(slug, { month: m });
       if (res.ok) {
         setInvoices(res.data);
         setError(null);
@@ -1007,7 +1014,7 @@ function InvoiceSection() {
 
   const generate = () => {
     startTransition(async () => {
-      const res = await generateInvoices({ month });
+      const res = await generateInvoices(slug, { month });
       if (res.ok) {
         setInvoices(res.data);
         setError(null);
@@ -1017,7 +1024,7 @@ function InvoiceSection() {
 
   const setStatus = (id: string, status: Invoice["status"]) => {
     startTransition(async () => {
-      const res = await updateInvoiceStatus({ id, status });
+      const res = await updateInvoiceStatus(slug, { id, status });
       if (res.ok) refresh(month);
       else setError(res.error);
     });
@@ -1025,7 +1032,7 @@ function InvoiceSection() {
 
   const send = (id: string) => {
     startTransition(async () => {
-      const res = await sendInvoice({ id });
+      const res = await sendInvoice(slug, { id });
       if (res.ok) refresh(month);
       else setError(res.error);
     });
@@ -1038,7 +1045,7 @@ function InvoiceSection() {
   const preview = (id: string) => {
     setPreviewingId(id);
     startTransition(async () => {
-      const res = await previewInvoicePdf({ id });
+      const res = await previewInvoicePdf(slug, { id });
       if (res.ok) window.open(res.url, "_blank");
       else setError(res.error);
       setPreviewingId(null);
@@ -1231,10 +1238,12 @@ const REASON_META: Record<
 };
 
 function RefundsByReasonSection({
+  slug,
   fromISO,
   toISO,
   preloaded,
 }: {
+  slug: string;
   fromISO: string;
   toISO: string;
   preloaded: RefundsResult | null;
@@ -1245,7 +1254,7 @@ function RefundsByReasonSection({
 
   const load = useCallback(() => {
     startTransition(async () => {
-      const res = await getRefundsByReason({ fromISO, toISO });
+      const res = await getRefundsByReason(slug, { fromISO, toISO });
       if (res.ok) {
         setData(res.data);
         setError(null);
@@ -1439,7 +1448,7 @@ function fmtDate(iso: string | null) {
   });
 }
 
-function RefundSection() {
+function RefundSection({ slug }: { slug: string }) {
   const [phone, setPhone] = useState("");
   const [rides, setRides] = useState<RefundableRide[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -1451,7 +1460,7 @@ function RefundSection() {
     setError(null);
     setNote(null);
     startTransition(async () => {
-      const res = await searchRefundableRides({ phone });
+      const res = await searchRefundableRides(slug, { phone });
       if (res.ok) setRides(res.data);
       else setError(res.error);
     });
@@ -1548,6 +1557,7 @@ function RefundSection() {
 
       {active && (
         <RefundModal
+          slug={slug}
           ride={active}
           onClose={() => setActive(null)}
           onDone={(msg) => {
@@ -1562,10 +1572,12 @@ function RefundSection() {
 }
 
 function RefundModal({
+  slug,
   ride,
   onClose,
   onDone,
 }: {
+  slug: string;
   ride: RefundableRide;
   onClose: () => void;
   onDone: (message: string) => void;
@@ -1593,7 +1605,7 @@ function RefundModal({
     }
     setError(null);
     startTransition(async () => {
-      const res = await refundRide({
+      const res = await refundRide(slug, {
         rideId: ride.id,
         amountCents: mode === "full" ? undefined : amountCents,
         reason,

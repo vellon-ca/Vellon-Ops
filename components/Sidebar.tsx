@@ -3,18 +3,30 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 
+// Paths are relative to the spoke: every module now lives under /<slug>/.
 const NAV = [
-  { href: "/overview", label: "Overview" },
-  { href: "/companies", label: "Companies" },
-  { href: "/onboarding", label: "Onboarding" },
-  { href: "/revenue", label: "Revenue" },
-  { href: "/health", label: "DB / Ops health" },
-  { href: "/reports", label: "Reports" },
-  { href: "/configuration", label: "Configuration" },
+  { path: "overview", label: "Overview" },
+  { path: "companies", label: "Companies" },
+  { path: "onboarding", label: "Onboarding" },
+  { path: "revenue", label: "Revenue" },
+  { path: "health", label: "DB / Ops health" },
+  { path: "reports", label: "Reports" },
+  { path: "configuration", label: "Configuration" },
 ];
 
-export function Sidebar({ email }: { email: string | null }) {
+export function Sidebar({
+  email,
+  slug,
+  projectName,
+  environment,
+}: {
+  email: string | null;
+  slug: string;
+  projectName: string;
+  environment: "prod" | "dev";
+}) {
   const pathname = usePathname();
+  const isDev = environment !== "prod";
 
   return (
     <aside className="flex w-60 shrink-0 flex-col border-r border-zinc-800 bg-zinc-900/40">
@@ -25,6 +37,17 @@ export function Sidebar({ email }: { email: string | null }) {
             Vellon Ops
           </span>
         </Link>
+        {/* Which spoke you are looking at is load-bearing, not decoration:
+            the modules below read and write a real customer database, and a
+            dev spoke's numbers are indistinguishable from prod's at a glance. */}
+        <div className="mt-2 flex items-center gap-2">
+          <span className="truncate text-xs text-zinc-300">{projectName}</span>
+          {isDev && (
+            <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-400">
+              {environment}
+            </span>
+          )}
+        </div>
         <Link
           href="/projects"
           className="mt-1 block text-xs text-zinc-500 hover:text-zinc-300"
@@ -35,12 +58,12 @@ export function Sidebar({ email }: { email: string | null }) {
 
       <nav className="flex-1 space-y-1 px-3">
         {NAV.map((item) => {
-          const active =
-            pathname === item.href || pathname.startsWith(item.href + "/");
+          const href = `/${slug}/${item.path}`;
+          const active = pathname === href || pathname.startsWith(href + "/");
           return (
             <Link
-              key={item.href}
-              href={item.href}
+              key={item.path}
+              href={href}
               className={
                 "block rounded-md px-3 py-2 text-sm transition-colors " +
                 (active

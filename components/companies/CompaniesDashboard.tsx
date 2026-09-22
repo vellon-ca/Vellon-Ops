@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
-import { listCompanies, type CompanyRow } from "@/app/(app)/onboarding/actions";
+import { listCompanies, type CompanyRow } from "@/app/(app)/[slug]/onboarding/actions";
 import { EditCompanyModal } from "./EditCompanyModal";
 
 // The overall onboarding state a row is in, derived from its pieces.
@@ -31,13 +31,13 @@ function StripeCell({ r }: { r: CompanyRow }) {
   return <span className="text-zinc-600">— not started</span>;
 }
 
-export function CompaniesDashboard() {
+export function CompaniesDashboard({ slug }: { slug: string }) {
   const [rows, setRows] = useState<CompanyRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [editing, setEditing] = useState<string | null>(null);
 
   const load = useCallback(async () => {
-    const res = await listCompanies();
+    const res = await listCompanies(slug);
     if (res.ok) {
       setRows(res.data);
       setError(null);
@@ -163,6 +163,7 @@ export function CompaniesDashboard() {
 
       {editing && (
         <EditCompanyModal
+          slug={slug}
           companyId={editing}
           onClose={() => setEditing(null)}
           onSaved={() => {
