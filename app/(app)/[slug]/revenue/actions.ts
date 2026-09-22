@@ -700,7 +700,11 @@ async function buildAndStoreInvoicePdf(
     vellon: settingsRes.data,
   });
 
-  const pdfPath = `mgcj/${invoice.company_id}/${invoice.period_month}.pdf`;
+  // Namespaced by spoke. Dev mgcj is a RESTORED COPY of prod, so company UUIDs
+  // are identical across the two — with a hardcoded "mgcj/" prefix and
+  // upsert:true below, a dev-spoke PDF silently overwrote the prod invoice
+  // PDF for the same company and month.
+  const pdfPath = `${spoke.slug}/${invoice.company_id}/${invoice.period_month}.pdf`;
   const { error: uploadErr } = await supabaseAdmin.storage
     .from("invoices")
     .upload(pdfPath, Buffer.from(pdfBytes), {
