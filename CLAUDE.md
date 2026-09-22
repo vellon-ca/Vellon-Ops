@@ -66,3 +66,35 @@ no linting and the CI command stays byte-identical to what Vercel runs. (Note `n
 drops into an interactive setup prompt, which would hang a runner — don't add it casually.)
 
 Typecheck is a separate step from the build so a type error reports as a type error.
+
+---
+
+## Deployment
+
+Vercel project `vellon-ops`, scope `victor-onyebuchi-s-projects` (a **personal** Vercel
+account hosting an org repo — works, but it is the same identity split that GitHub just
+closed, and it is on the consolidation list). Production branch `main`; every branch push
+also builds a Preview.
+
+**Node is pinned by `engines.node` in `package.json`, not by the Vercel project setting.**
+Vercel reads `engines`, and so does CI via `node-version-file`. Don't add a `.nvmrc` —
+Vercel does not read one, so it would be a second copy free to drift from the value
+actually used.
+
+**Moving the repo to a GitHub org silently breaks deployment** (hit 2026-09-21, on the
+move to `vellon-ca`). The Vercel GitHub App is installed per account/org and does **not**
+follow a transferred repo, so the project keeps showing the old path, keeps reporting as
+connected, and simply receives no events. There is no error anywhere — pushes just stop
+producing deployments, while GitHub Actions checks stay green because they moved correctly.
+
+Diagnosing it: compare the newest deployment's age against the last push
+(`npx vercel ls`). A gap is the whole signal. `npx vercel git connect` fails with
+"Make sure there aren't any typos and that you have access to the repository if it's
+private" — which is what a missing org-level app installation looks like, not a typo.
+
+Fixing it: install/configure the Vercel GitHub App on the org
+(`github.com/apps/vercel` → Configure → the org → grant repository access), then reconnect
+the project's Git repository. **Reconnecting loses nothing** — environment variables,
+domains and deployment history live on the project, including the sensitive
+`MGCJ_STRIPE_SECRET` records that cannot be read back. Re-check the production branch
+afterwards.
