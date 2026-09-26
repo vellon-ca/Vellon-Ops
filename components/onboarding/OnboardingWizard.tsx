@@ -54,7 +54,7 @@ export function OnboardingWizard({ slug }: { slug: string }) {
   const [companyId, setCompanyId] = useState<string | null>(null);
   const [companyName, setCompanyName] = useState("");
   const [adminId, setAdminId] = useState<string | null>(null);
-  const [dispatcherRows, setDispatcherRows] = useState([{ name: "", phone: "" }]);
+  const [dispatcherRows, setDispatcherRows] = useState([{ name: "", email: "" }]);
   const [dispatchersCreated, setDispatchersCreated] = useState<DispatcherResult[]>([]);
   const [invites, setInvites] = useState<InviteResult[]>([]);
   const [driverRows, setDriverRows] = useState([{ name: "", phone: "" }]);
@@ -79,7 +79,7 @@ export function OnboardingWizard({ slug }: { slug: string }) {
     setCompanyId(null);
     setCompanyName("");
     setAdminId(null);
-    setDispatcherRows([{ name: "", phone: "" }]);
+    setDispatcherRows([{ name: "", email: "" }]);
     setDispatchersCreated([]);
     setInvites([]);
     setDriverRows([{ name: "", phone: "" }]);
@@ -284,7 +284,7 @@ export function OnboardingWizard({ slug }: { slug: string }) {
                 const res = await createAdmin(slug, {
                   companyId: companyId!,
                   name: String(f.get("dname")),
-                  phone: String(f.get("dphone")),
+                  email: String(f.get("demail")),
                 });
                 if (!res.ok) return setError(res.error);
                 setAdminId(res.data.userId);
@@ -296,18 +296,19 @@ export function OnboardingWizard({ slug }: { slug: string }) {
               Admin for <span className="text-zinc-300">{companyName}</span> — can
               configure pricing, vehicle classes, and other staff, in addition to
               day-to-day dispatch. Every company needs one; this is a
-              vendor-provisioned seat. They log into the dashboard with this phone
-              via OTP.
+              vendor-provisioned seat. They sign into the dashboard with this
+              email address, via a code we send them.
             </p>
             <div className="space-y-1.5">
               <label className={label}>Admin name</label>
               <input name="dname" required className={input} />
             </div>
             <div className="space-y-1.5">
-              <label className={label}>Phone (E.164)</label>
+              <label className={label}>Email</label>
               <input
-                name="dphone"
-                placeholder="+19025551234"
+                name="demail"
+                type="email"
+                placeholder="owner@company.ca"
                 required
                 className={input}
               />
@@ -331,7 +332,7 @@ export function OnboardingWizard({ slug }: { slug: string }) {
                 const res = await createDispatchers(slug, {
                   companyId: companyId!,
                   dispatchers: dispatcherRows.filter(
-                    (d) => d.name.trim() && d.phone.trim(),
+                    (d) => d.name.trim() && d.email.trim(),
                   ),
                 });
                 if (!res.ok) return setError(res.error);
@@ -361,12 +362,13 @@ export function OnboardingWizard({ slug }: { slug: string }) {
                     className={input}
                   />
                   <input
-                    placeholder="+19025551234"
-                    value={row.phone}
+                    type="email"
+                    placeholder="dispatcher@company.ca"
+                    value={row.email}
                     onChange={(e) =>
                       setDispatcherRows((rows) =>
                         rows.map((r, j) =>
-                          j === i ? { ...r, phone: e.target.value } : r,
+                          j === i ? { ...r, email: e.target.value } : r,
                         ),
                       )
                     }
@@ -389,7 +391,7 @@ export function OnboardingWizard({ slug }: { slug: string }) {
             <button
               type="button"
               onClick={() =>
-                setDispatcherRows((rows) => [...rows, { name: "", phone: "" }])
+                setDispatcherRows((rows) => [...rows, { name: "", email: "" }])
               }
               className="text-xs text-accent hover:text-accent-hover"
             >

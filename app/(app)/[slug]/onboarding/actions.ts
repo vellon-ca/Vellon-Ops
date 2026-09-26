@@ -98,7 +98,12 @@ export async function createCompany(
   return { ok: true, data: { companyId: data.id, name } };
 }
 
-// ── Step 2: create the company's admin (phone-OTP, vendor-provisioned) ──
+// ── Step 2: create the company's admin (email-OTP, vendor-provisioned) ──
+// EMAIL, not phone, since 2026-09-26 — Phase 1 of
+// mgcj-app/.claude/notes/email-auth-design.md makes email the ONLY dispatch
+// credential. No phone is collected: an admin-typed number is unverified, and
+// writing it to profiles.phone would make phone_is_registered() /
+// phone_is_dispatch() answer yes for a number nobody proved they hold.
 // Admin accounts are a vendor-managed seat — Vellon provisions them here via
 // service role, never self-serve — see mgcj-app's
 // 20260715_dispatcher_role_split.sql / 20260716_dispatcher_only_management.sql.
@@ -111,23 +116,26 @@ export async function createAdmin(
   input: {
   companyId: string;
   name: string;
-  phone: string;
+  email: string;
   },
 ): Promise<ActionResult<{ userId: string }>> {
   const owner = await requirePlatformOwner();
 
   const name = input.name.trim();
-  const phone = input.phone.trim();
+  // Lowercased: GoTrue normalizes the credential, and email_is_dispatch()
+  // compares case-insensitively, so the profiles copy must match.
+  const email = input.email.trim().toLowerCase();
   if (!name) return { ok: false, error: "Admin name is required." };
-  if (!/^\+[1-9]\d{7,14}$/.test(phone))
-    return { ok: false, error: "Phone must be E.164 format, e.g. +19025551234." };
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
+    return { ok: false, error: "Enter a valid email address." };
 
   const spoke = await loadSpoke(slug);
   const mgcj = spokeSupabase(spoke);
 
   // Idempotent: if this company already has an admin (e.g. a resumed run, or a
   // step recomputed wrong), return that one instead of trying to create a
-  // second auth user — auth.admin.createUser hard-errors on a duplicate phone.
+  // second auth user — auth.admin.createUser hard-errors on a duplicate email
+  // exactly as it did on a duplicate phone.
   const { data: existingAdmin } = await mgcj
     .from("profiles")
     .select("id, name")
@@ -137,9 +145,11 @@ export async function createAdmin(
     .maybeSingle();
   if (existingAdmin) return { ok: true, data: { userId: existingAdmin.id } };
 
+  // email_confirm: true is what makes the seat usable on day one — an
+  // unconfirmed address cannot receive a sign-in code.
   const { data: created, error: cErr } = await mgcj.auth.admin.createUser({
-    phone,
-    phone_confirm: true,
+    email,
+    email_confirm: true,
   });
   if (cErr || !created.user)
     return { ok: false, error: cErr?.message ?? "Failed to create auth user." };
@@ -152,7 +162,7 @@ export async function createAdmin(
       role: "admin",
       company_id: input.companyId,
       name,
-      phone,
+      email,
       is_active: true,
     },
     { onConflict: "id" },
@@ -168,7 +178,7 @@ export async function createAdmin(
     projectSlug: spoke.slug,
     action: "admin.create",
     target: created.user.id,
-    after: { company_id: input.companyId, name, phone },
+    after: { company_id: input.companyId, name, email },
   });
 
   return { ok: true, data: { userId: created.user.id } };
@@ -183,24 +193,24 @@ export async function createAdmin(
 // just lets Vellon seed the first few at onboarding time so the company isn't
 // stuck with one login. Entirely optional — a company with only an admin is a
 // valid, complete onboarding.
-export type DispatcherResult = { userId: string; name: string; phone: string };
+export type DispatcherResult = { userId: string; name: string; email: string };
 
 export async function createDispatchers(
   slug: string,
   input: {
   companyId: string;
-  dispatchers: { name: string; phone: string }[];
+  dispatchers: { name: string; email: string }[];
   },
 ): Promise<ActionResult<{ created: DispatcherResult[] }>> {
   const owner = await requirePlatformOwner();
 
   const dispatchers = input.dispatchers
-    .map((d) => ({ name: d.name.trim(), phone: d.phone.trim() }))
-    .filter((d) => d.name && d.phone);
+    .map((d) => ({ name: d.name.trim(), email: d.email.trim().toLowerCase() }))
+    .filter((d) => d.name && d.email);
   if (dispatchers.length === 0) return { ok: true, data: { created: [] } };
   for (const d of dispatchers) {
-    if (!/^\+[1-9]\d{7,14}$/.test(d.phone))
-      return { ok: false, error: `Invalid phone: ${d.phone} (use E.164, e.g. +19025551234).` };
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(d.email))
+      return { ok: false, error: `Invalid email: ${d.email}` };
   }
 
   const spoke = await loadSpoke(slug);
@@ -209,11 +219,11 @@ export async function createDispatchers(
 
   for (const d of dispatchers) {
     const { data: user, error: cErr } = await mgcj.auth.admin.createUser({
-      phone: d.phone,
-      phone_confirm: true,
+      email: d.email,
+      email_confirm: true,
     });
     if (cErr || !user.user)
-      return { ok: false, error: cErr?.message ?? `Failed to create account for ${d.phone}.` };
+      return { ok: false, error: cErr?.message ?? `Failed to create account for ${d.email}.` };
 
     const { error: pErr } = await mgcj.from("profiles").upsert(
       {
@@ -221,7 +231,7 @@ export async function createDispatchers(
         role: "dispatcher",
         company_id: input.companyId,
         name: d.name,
-        phone: d.phone,
+        email: d.email,
         is_active: true,
       },
       { onConflict: "id" },
@@ -231,7 +241,7 @@ export async function createDispatchers(
       return { ok: false, error: pErr.message };
     }
 
-    created.push({ userId: user.user.id, name: d.name, phone: d.phone });
+    created.push({ userId: user.user.id, name: d.name, email: d.email });
   }
 
   await writeAudit({
