@@ -147,6 +147,16 @@ export async function createAdmin(
 
   // email_confirm: true is what makes the seat usable on day one — an
   // unconfirmed address cannot receive a sign-in code.
+  // Announce the address to the mgcj signup gate before creating the account.
+  // before_user_created rejects any email account creation with no unexpired
+  // slip, and Supabase does not document whether that hook fires for the Admin
+  // API — required if it does, harmless if it does not. Must precede createUser.
+  const { error: aErr } = await mgcj.rpc("allow_staff_email", {
+    p_email: email,
+    p_note: "vellon-ops:createAdmin",
+  });
+  if (aErr) return { ok: false, error: aErr.message };
+
   const { data: created, error: cErr } = await mgcj.auth.admin.createUser({
     email,
     email_confirm: true,
@@ -218,6 +228,13 @@ export async function createDispatchers(
   const created: DispatcherResult[] = [];
 
   for (const d of dispatchers) {
+    // Same signup-gate slip as createAdmin above, once per seat.
+    const { error: aErr } = await mgcj.rpc("allow_staff_email", {
+      p_email: d.email,
+      p_note: "vellon-ops:createDispatchers",
+    });
+    if (aErr) return { ok: false, error: aErr.message };
+
     const { data: user, error: cErr } = await mgcj.auth.admin.createUser({
       email: d.email,
       email_confirm: true,
