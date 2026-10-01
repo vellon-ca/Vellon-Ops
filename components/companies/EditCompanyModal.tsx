@@ -10,6 +10,9 @@ import {
   statementLinePreview,
   validateSuffix,
   SUFFIX_MAX,
+  taxLinePreview,
+  validateTaxLabel,
+  TAX_LABEL_MAX,
 } from "@/lib/companyIdentity";
 
 const input =
@@ -33,6 +36,12 @@ export function EditCompanyModal({
   // Stripe TRUNCATES an over-long suffix silently and returns a healthy charge,
   // so seeing the composed line is the only feedback that exists.
   const [suffix, setSuffix] = useState("");
+  // Same reason as the suffix: the label and the rate are two fields that have
+  // to agree with each other, and nothing downstream can check that they do —
+  // 'GST' beside 14% satisfies every constraint and prints a wrong receipt. The
+  // preview is the only place the pair is visible as one line.
+  const [taxLabel, setTaxLabel] = useState("HST");
+  const [taxRate, setTaxRate] = useState(0);
   const [pending, startTransition] = useTransition();
 
   useEffect(() => {
@@ -42,6 +51,8 @@ export function EditCompanyModal({
       if (res.ok) {
         setCompany(res.data);
         setSuffix(res.data.statementDescriptorSuffix ?? "");
+        setTaxLabel(res.data.taxLabel);
+        setTaxRate(res.data.taxRatePercent);
       } else setError(res.error);
     });
     return () => {
@@ -64,6 +75,7 @@ export function EditCompanyModal({
         slug: String(f.get("slug") || ""),
         statementDescriptorSuffix: suffix,
         taxRatePercent: Number(f.get("taxRate")),
+        taxLabel,
       });
       if (!res.ok) return setError(res.error);
       onSaved();
@@ -148,19 +160,47 @@ export function EditCompanyModal({
               <input name="hst" defaultValue={company.hstNumber ?? ""} className={input} />
             </div>
             <div className="space-y-1.5">
-              <label className={label}>Tax rate %</label>
-              <input
-                name="taxRate"
-                type="number"
-                step="0.01"
-                required
-                defaultValue={company.taxRatePercent}
-                className={input}
-              />
+              <div className="grid grid-cols-2 gap-3">
+                <div className="space-y-1.5">
+                  <label className={label}>Tax label</label>
+                  <input
+                    name="taxLabel"
+                    value={taxLabel}
+                    maxLength={TAX_LABEL_MAX}
+                    onChange={(e) => setTaxLabel(e.target.value.toUpperCase())}
+                    placeholder="HST"
+                    className={input}
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <label className={label}>Tax rate %</label>
+                  <input
+                    name="taxRate"
+                    type="number"
+                    step="0.01"
+                    required
+                    value={taxRate}
+                    onChange={(e) => setTaxRate(Number(e.target.value))}
+                    className={input}
+                  />
+                </div>
+              </div>
+              {validateTaxLabel(taxLabel) && (
+                <p className="text-xs text-amber-500">{validateTaxLabel(taxLabel)}</p>
+              )}
               <p className="text-xs text-zinc-500">
-                Nova Scotia is 14% (since 1 Apr 2025). Frozen onto each ride at
-                completion, so a change here only affects rides completed after
-                it — receipts already issued stay as they were.
+                Receipt reads{" "}
+                <span className="font-mono text-zinc-300">
+                  {taxLinePreview(taxLabel, taxRate)}
+                </span>
+                . HST in NS/NB/NL/PEI/ON, GST in AB and the territories, and a
+                combined form like GST + PST elsewhere — whether a provincial tax
+                applies to taxi fares at all is a per-province judgement.
+              </p>
+              <p className="text-xs text-zinc-500">
+                Nova Scotia is 14% (since 1 Apr 2025). The rate is frozen onto
+                each ride at completion, so a change here only affects rides
+                completed after it — receipts already issued stay as they were.
                 {!company.hstNumber && (
                   <>
                     {" "}

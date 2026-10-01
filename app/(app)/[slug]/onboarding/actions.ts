@@ -15,6 +15,7 @@ import {
   validateSlug,
   validateSuffix,
   validateTaxRate,
+  validateTaxLabel,
 } from "@/lib/companyIdentity";
 
 export type ActionResult<T> =
@@ -625,6 +626,8 @@ export type CompanyDetail = CompanyRow & {
   slug: string;
   statementDescriptorSuffix: string | null;
   taxRatePercent: number;
+  /** What the tax is CALLED on documents — HST, GST, 'GST + QST'. */
+  taxLabel: string;
 };
 
 export async function getCompanyForEdit(
@@ -638,7 +641,7 @@ export async function getCompanyForEdit(
   const { data: company, error } = await mgcj
     .from("companies")
     .select(
-      "id, name, slug, platform_fee_percent, base_fare, rate_per_km, hst_number, billing_email, billing_address, statement_descriptor_suffix, tax_rate_percent, stripe_account_id, stripe_onboarded",
+      "id, name, slug, platform_fee_percent, base_fare, rate_per_km, hst_number, billing_email, billing_address, statement_descriptor_suffix, tax_rate_percent, tax_label, stripe_account_id, stripe_onboarded",
     )
     .eq("id", companyId)
     .maybeSingle();
@@ -684,6 +687,7 @@ export async function getCompanyForEdit(
       statementDescriptorSuffix:
         (company.statement_descriptor_suffix as string | null) ?? null,
       taxRatePercent: Number(company.tax_rate_percent),
+      taxLabel: (company.tax_label as string | null) || "HST",
     },
   };
 }
@@ -702,6 +706,7 @@ export async function updateCompany(
   slug: string;
   statementDescriptorSuffix?: string;
   taxRatePercent: number;
+  taxLabel: string;
   },
 ): Promise<ActionResult<{ companyId: string }>> {
   const owner = await requirePlatformOwner();
@@ -727,13 +732,17 @@ export async function updateCompany(
   const taxError = validateTaxRate(input.taxRatePercent);
   if (taxError) return { ok: false, error: taxError };
 
+  const taxLabel = input.taxLabel.trim();
+  const taxLabelError = validateTaxLabel(taxLabel);
+  if (taxLabelError) return { ok: false, error: taxLabelError };
+
   const spoke = await loadSpoke(slug);
   const mgcj = spokeSupabase(spoke);
 
   const { data: before } = await mgcj
     .from("companies")
     .select(
-      "name, slug, platform_fee_percent, base_fare, rate_per_km, hst_number, billing_email, billing_address, statement_descriptor_suffix, tax_rate_percent",
+      "name, slug, platform_fee_percent, base_fare, rate_per_km, hst_number, billing_email, billing_address, statement_descriptor_suffix, tax_rate_percent, tax_label",
     )
     .eq("id", input.companyId)
     .maybeSingle();
@@ -749,6 +758,7 @@ export async function updateCompany(
     slug: companySlug,
     statement_descriptor_suffix: suffix,
     tax_rate_percent: input.taxRatePercent,
+    tax_label: taxLabel,
   };
 
   // Note what this does NOT do: renaming a company does not re-derive its slug or

@@ -19,7 +19,17 @@ export type InvoicePdfInput = {
   cashFaresTotal: number;
   feePercent: number;
   rideCount: number;
+  /** The platform FEE alone, never fee+tax — see 0008_invoice_tax.sql. */
   amountDue: number;
+  /**
+   * NULL = no tax line on this document, which is correct whenever Vellon is
+   * not GST/HST-registered. Snapshotted on the invoice row, never read live
+   * off the company, so an issued document cannot be rewritten by a later
+   * rate change. Tax is EXCLUSIVE here: added to the fee, not extracted.
+   */
+  tax: { label: string; ratePercent: number; amount: number } | null;
+  /** amountDue + tax. Equals amountDue when `tax` is null. */
+  totalDue: number;
   vellon: {
     legalName: string | null;
     businessNumber: string | null;
@@ -74,9 +84,16 @@ export async function buildInvoicePdf(input: InvoicePdfInput): Promise<Uint8Arra
   draw(input.invoiceNumber, right, y, { size: 10, color: gray, align: "right" });
 
   y -= 14;
+  // The registration line is gated on `tax`, NOT on hstNumber alone. Printing
+  // "HST Reg: 12345" beside a document with no tax line was the original §3
+  // defect: it asserts a taxable supply the invoice never charged for. One
+  // gate, so the two halves of that claim cannot disagree. (BN is not a tax
+  // claim and prints whenever it is configured.)
   const regNumbers = [
     input.vellon.businessNumber ? `BN: ${input.vellon.businessNumber}` : null,
-    input.vellon.hstNumber ? `HST Reg: ${input.vellon.hstNumber}` : null,
+    input.tax && input.vellon.hstNumber
+      ? `${input.tax.label} Reg: ${input.vellon.hstNumber}`
+      : null,
   ]
     .filter(Boolean)
     .join("   ");
@@ -120,13 +137,22 @@ export async function buildInvoicePdf(input: InvoicePdfInput): Promise<Uint8Arra
   draw(`Platform fee (${input.feePercent}%)`, left + 6, y, { size: 10, color: gray });
   draw(`$${input.amountDue.toFixed(2)}`, right - 6, y, { size: 10, color: gray, align: "right" });
 
+  if (input.tax) {
+    y -= 20;
+    draw(`${input.tax.label} (${formatRate(input.tax.ratePercent)}%)`, left + 6, y, {
+      size: 10,
+      color: gray,
+    });
+    draw(`$${input.tax.amount.toFixed(2)}`, right - 6, y, { size: 10, color: gray, align: "right" });
+  }
+
   y -= 22;
   rule(y, rgb(0.8, 0.8, 0.8));
 
   // ── Total ─────────────────────────────────────────────────────────────
   y -= 18;
   draw("Amount due", left + 6, y, { size: 13, font: bold });
-  draw(`$${input.amountDue.toFixed(2)}`, right - 6, y, { size: 13, font: bold, align: "right" });
+  draw(`$${input.totalDue.toFixed(2)}`, right - 6, y, { size: 13, font: bold, align: "right" });
 
   y -= 22;
   rule(y);
@@ -146,6 +172,14 @@ export async function buildInvoicePdf(input: InvoicePdfInput): Promise<Uint8Arra
   });
 
   return doc.save();
+}
+
+// 14 rather than 14.00. Deliberately the same one-liner as mgcj's
+// send-ride-receipt: two documents in one system should print a rate
+// identically. (A trailing-zero strip by regex is the trap here — it turns a
+// 10% rate into "1".)
+function formatRate(percent: number): string {
+  return String(Number(percent.toFixed(2)));
 }
 
 // Simple word-wrap for the free-text payment-instructions field, since it can

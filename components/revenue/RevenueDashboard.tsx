@@ -1052,10 +1052,16 @@ function InvoiceSection({ slug }: { slug: string }) {
     });
   };
 
-  const total = useMemo(
-    () => invoices.filter((i) => i.status !== "void").reduce((s, i) => s + Number(i.amount_due), 0),
-    [invoices],
-  );
+  // TWO figures, named apart on purpose. `amount_due` is the platform FEE and
+  // is what the revenue rollup treats as revenue; the payable figure on a taxed
+  // invoice is fee + tax, which is a receivable and not revenue. A single
+  // ambiguous "total" is how one of those silently becomes the other.
+  const totals = useMemo(() => {
+    const live = invoices.filter((i) => i.status !== "void");
+    const fee = live.reduce((s, i) => s + Number(i.amount_due), 0);
+    const tax = live.reduce((s, i) => s + Number(i.tax_amount ?? 0), 0);
+    return { fee, tax, receivable: fee + tax };
+  }, [invoices]);
 
   return (
     <section>
@@ -1124,7 +1130,12 @@ function InvoiceSection({ slug }: { slug: string }) {
                   {Number(inv.fee_percent)}%
                 </td>
                 <td className="px-4 py-2.5 text-right font-medium text-zinc-100">
-                  {cad(Number(inv.amount_due))}
+                  {cad(Number(inv.total_due ?? inv.amount_due))}
+                  {inv.tax_amount != null && Number(inv.tax_amount) > 0 && (
+                    <span className="block text-xs font-normal text-zinc-600">
+                      incl. {cad(Number(inv.tax_amount))} {inv.tax_label ?? "tax"}
+                    </span>
+                  )}
                 </td>
                 <td className="px-4 py-2.5">
                   <span
@@ -1168,10 +1179,15 @@ function InvoiceSection({ slug }: { slug: string }) {
             <tfoot>
               <tr className="border-t border-zinc-800 text-sm">
                 <td className="px-4 py-2.5 text-zinc-500" colSpan={3}>
-                  Billable this month (excl. void)
+                  Receivable this month (excl. void)
+                  {totals.tax > 0 && (
+                    <span className="block text-xs text-zinc-600">
+                      Fee revenue {cad(totals.fee)} + tax {cad(totals.tax)}
+                    </span>
+                  )}
                 </td>
                 <td className="px-4 py-2.5 text-right font-semibold text-accent">
-                  {cad(total)}
+                  {cad(totals.receivable)}
                 </td>
                 <td colSpan={2} />
               </tr>

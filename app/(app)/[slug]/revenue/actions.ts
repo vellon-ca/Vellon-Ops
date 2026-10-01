@@ -466,6 +466,13 @@ export type Invoice = {
   paid_at: string | null;
   invoice_number: string | null;
   pdf_path: string | null;
+  // 0008_invoice_tax.sql. NULL throughout on any invoice generated before tax
+  // was modelled, and on every invoice while Vellon is not registered — read
+  // total_due as `total_due ?? amount_due`, never as 0.
+  tax_label: string | null;
+  tax_rate_percent: number | null;
+  tax_amount: number | null;
+  total_due: number | null;
 };
 
 export async function listInvoices(
@@ -549,6 +556,61 @@ export async function generateInvoices(
       .map((i) => i.company_id),
   );
 
+  // ── Tax on the fee ────────────────────────────────────────────────────
+  //
+  // TWO independent gates, one join apart (0008_invoice_tax.sql):
+  //   whether the FEE is taxed -> VELLON's registration (platform_settings)
+  //   whether the FARE is taxed -> the COMPANY's (mgcj companies.hst_number)
+  // Only the first one belongs here. As of 2026-10-01 Vellon is not
+  // registered, so every invoice generated today correctly carries no tax.
+  //
+  // The RATE is the recipient's: a B2B service is rated at the customer's
+  // place of supply, so it comes from the billed company's jurisdiction, not
+  // Vellon's. Snapshotted onto the row below so the PDF never reads it live.
+  const settingsRes = await getPlatformSettings();
+  if (!settingsRes.ok) return { ok: false, error: settingsRes.error };
+  const vellonRegistered = !!settingsRes.data.hstNumber;
+
+  const taxByCompany = new Map<string, { label: string; ratePercent: number }>();
+  if (vellonRegistered) {
+    const mgcj = spokeSupabase(spoke);
+    const { data: taxRows, error: taxErr } = await mgcj
+      .from("companies")
+      .select("id, tax_label, tax_rate_percent")
+      .in("id", [...perCompany.keys()]);
+    if (taxErr) return { ok: false, error: taxErr.message };
+    for (const r of taxRows ?? []) {
+      const rate = Number(r.tax_rate_percent);
+      if (!(rate > 0)) continue;
+      taxByCompany.set(r.id, { label: r.tax_label || "HST", ratePercent: rate });
+    }
+  }
+
+  // Registered Vellon, unreadable rate: issue the invoice with NO tax line and
+  // say so loudly, rather than inventing a rate onto a tax document. Same call
+  // as send-ride-receipt makes in the mirror situation — and the cost lands on
+  // Vellon's own margin here, not on a false claim to a customer.
+  const taxFor = (companyId: string, fee: number) => {
+    if (!vellonRegistered) return null;
+    const t = taxByCompany.get(companyId);
+    if (!t) {
+      console.error(
+        `[generateInvoices] company ${companyId}: Vellon is tax-registered but ` +
+        `the company has no usable tax_rate_percent on spoke ${spoke.slug} — ` +
+        `invoicing the fee with NO tax line. Check that mgcj 20260930000000 and ` +
+        `20261001020000 are applied to that project.`,
+      );
+      return null;
+    }
+    return {
+      label: t.label,
+      ratePercent: t.ratePercent,
+      // EXCLUSIVE: on top of the fee, not extracted from it. Rounded once,
+      // here, and stored as the figure the document prints.
+      amount: round2(fee * (t.ratePercent / 100)),
+    };
+  };
+
   // Deterministic — same company/month always yields the same number, so
   // regenerating a draft never reassigns it.
   const yyyymm = first.slice(0, 4) + first.slice(5, 7);
@@ -557,24 +619,34 @@ export async function generateInvoices(
 
   const toUpsert = [...perCompany.entries()]
     .filter(([companyId, e]) => e.fares > 0 && !locked.has(companyId))
-    .map(([companyId, e]) => ({
-      project_slug: spoke.slug,
-      company_id: companyId,
-      company_name: e.name,
-      period_month: first,
-      cash_fares_total: round2(e.fares),
-      fee_percent: e.feePct,
-      // Sourced from the RPC's own per-ride fee_total (frozen per-ride rate),
-      // never re-derived from fares*feePct — a mid-period rate change means
-      // feePct is only a blended display value, not something the dollar
-      // amount can be recomputed from.
-      amount_due: round2(e.feeTotal),
-      ride_count: e.rides,
-      status: "draft",
-      generated_by: owner.id,
-      generated_at: new Date().toISOString(),
-      invoice_number: invoiceNumber(companyId),
-    }));
+    .map(([companyId, e]) => {
+      const fee = round2(e.feeTotal);
+      const tax = taxFor(companyId, fee);
+      return {
+        project_slug: spoke.slug,
+        company_id: companyId,
+        company_name: e.name,
+        period_month: first,
+        cash_fares_total: round2(e.fares),
+        fee_percent: e.feePct,
+        // Sourced from the RPC's own per-ride fee_total (frozen per-ride rate),
+        // never re-derived from fares*feePct — a mid-period rate change means
+        // feePct is only a blended display value, not something the dollar
+        // amount can be recomputed from.
+        // Stays the FEE alone — the revenue rollup sums this column as revenue.
+        // The payable figure is total_due.
+        amount_due: fee,
+        tax_label: tax?.label ?? null,
+        tax_rate_percent: tax?.ratePercent ?? null,
+        tax_amount: tax?.amount ?? null,
+        total_due: round2(fee + (tax?.amount ?? 0)),
+        ride_count: e.rides,
+        status: "draft",
+        generated_by: owner.id,
+        generated_at: new Date().toISOString(),
+        invoice_number: invoiceNumber(companyId),
+      };
+    });
 
   if (toUpsert.length > 0) {
     const { error } = await supabaseAdmin
@@ -638,7 +710,10 @@ type BuiltInvoicePdf = {
   cashFaresTotal: number;
   feePercent: number;
   rideCount: number;
+  /** The fee alone. `totalDue` is what the company owes. */
   amountDue: number;
+  tax: { label: string; ratePercent: number; amount: number } | null;
+  totalDue: number;
   paymentInstructions: string | null;
   mailingAddress: string | null;
   billingEmail: string | null;
@@ -657,7 +732,7 @@ async function buildAndStoreInvoicePdf(
   const { data: invoice, error: invErr } = await supabaseAdmin
     .from("invoices")
     .select(
-      "id, company_id, company_name, period_month, cash_fares_total, fee_percent, ride_count, amount_due, invoice_number",
+      "id, company_id, company_name, period_month, cash_fares_total, fee_percent, ride_count, amount_due, invoice_number, tax_label, tax_rate_percent, tax_amount, total_due",
     )
     .eq("id", invoiceId)
     .maybeSingle();
@@ -687,6 +762,23 @@ async function buildAndStoreInvoicePdf(
   });
   const invoiceNumber = invoice.invoice_number ?? `INV-${invoice.id.slice(0, 8).toUpperCase()}`;
 
+  // Read off the INVOICE ROW, never live off the company: an issued tax
+  // document must not be rewritten by a later rate change. A NULL rate means
+  // no tax line was charged — which is every invoice generated before
+  // 0008_invoice_tax.sql, and every one generated while Vellon is unregistered.
+  // NULL total_due therefore reads as amount_due, never as 0.
+  const taxRate = invoice.tax_rate_percent == null ? null : Number(invoice.tax_rate_percent);
+  const tax =
+    taxRate != null && taxRate > 0 && invoice.tax_amount != null
+      ? {
+          label: invoice.tax_label || "HST",
+          ratePercent: taxRate,
+          amount: Number(invoice.tax_amount),
+        }
+      : null;
+  const totalDue =
+    invoice.total_due != null ? Number(invoice.total_due) : Number(invoice.amount_due);
+
   const pdfBytes = await buildInvoicePdf({
     invoiceNumber,
     periodLabel,
@@ -697,6 +789,8 @@ async function buildAndStoreInvoicePdf(
     feePercent: Number(invoice.fee_percent),
     rideCount: invoice.ride_count,
     amountDue: Number(invoice.amount_due),
+    tax,
+    totalDue,
     vellon: settingsRes.data,
   });
 
@@ -731,6 +825,8 @@ async function buildAndStoreInvoicePdf(
       feePercent: Number(invoice.fee_percent),
       rideCount: invoice.ride_count,
       amountDue: Number(invoice.amount_due),
+      tax,
+      totalDue,
       paymentInstructions: settingsRes.data.paymentInstructions,
       mailingAddress: settingsRes.data.mailingAddress,
       billingEmail: company?.billing_email ?? null,
@@ -789,6 +885,8 @@ export async function sendInvoice(
     feePercent,
     rideCount,
     amountDue,
+    tax,
+    totalDue,
     paymentInstructions,
     mailingAddress,
     billingEmail,
@@ -812,12 +910,16 @@ export async function sendInvoice(
     body: JSON.stringify({
       from: RESEND_FROM_ADDRESS,
       to: billingEmail,
-      subject: `Your Vellon platform fee invoice for ${periodLabel} — $${amountDue.toFixed(2)} due`,
+      // The headline figure is what they owe (fee + tax), matching the PDF's
+      // "Amount due". amountDue alone would understate it on a taxed invoice.
+      subject: `Your Vellon platform fee invoice for ${periodLabel} — $${totalDue.toFixed(2)} due`,
       html: buildInvoiceEmailHtml({
         companyName,
         invoiceNumber,
         periodLabel,
         amountDue,
+        tax,
+        totalDue,
         cashFaresTotal,
         feePercent,
         rideCount,
