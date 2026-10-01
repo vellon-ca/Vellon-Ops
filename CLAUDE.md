@@ -28,16 +28,24 @@ Don't assume future spokes share mgcj's schema — the connector pattern exists 
 
 - **`overview/`** — landing dashboard after login: revenue-at-a-glance, per-company cards, sparkline. Pulls from `revenue/actions.ts`'s functions rather than duplicating queries.
 - **`revenue/`** — the Revenue module (analytics) and the cash-invoice generator/sender, both in one `actions.ts`. See "Revenue & Invoicing" below — this is the module most tied to mgcj's `rides`/`companies` schema and the most likely to break silently if that schema shifts.
-- **`onboarding/`** — the only path for adding a new company today (`createCompany`/`createDispatcher`/company-settings edit).
-  **Staff seats are provisioned by EMAIL, not phone, since 2026-09-28** — `createAdmin` and
+- **`onboarding/`** — the only path for adding a new company today (`createCompany`/`createDispatcher`/company-settings edit). Fully manual, Victor-in-the-loop — no self-serve signup. Every mutating action here writes to `audit_log` via `lib/audit.ts::writeAudit()` with a `before`/`after` snapshot, which is genuinely useful later (see the fee-rate-history callout below) — don't skip `writeAudit` calls when adding new mutations here.
+
+  **Staff seats are provisioned by EMAIL, not phone, since 2026-09-28.** `createAdmin` and
   `createDispatchers` both call `admin.createUser({ email, email_confirm: true })`, and
-  `email_confirm` is what makes the seat usable on day one, since an unconfirmed address
-  cannot receive a sign-in code. Each announces the address to the mgcj signup gate via
+  `email_confirm` is what makes the seat usable on day one — an unconfirmed address cannot
+  receive a sign-in code. Each announces the address to the mgcj signup gate via
   `rpc("allow_staff_email")` **before** calling `createUser`; that gate rejects any email
-  account creation with no unexpired slip. Measured 2026-09-28: the hook does not currently
-  fire for the Admin API, so the call is insurance against undocumented behaviour changing —
-  keep it, and keep it first, because after `createUser` it would be too late and the failure
-  would read as GoTrue rejecting the address. Fully manual, Victor-in-the-loop — no self-serve signup. Every mutating action here writes to `audit_log` via `lib/audit.ts::writeAudit()` with a `before`/`after` snapshot, which is genuinely useful later (see the fee-rate-history callout below) — don't skip `writeAudit` calls when adding new mutations here.
+  account creation with no unexpired slip.
+
+  Measured 2026-09-28: the hook does **not** currently fire for the Admin API, so the slip is
+  insurance against undocumented behaviour changing rather than something load-bearing today.
+  Keep it, and keep it **first** — after `createUser` it would be too late, and the failure
+  would surface as GoTrue rejecting the address rather than as a missing slip.
+
+  These are two of the **four** credential-write sites that move together; the other two are
+  mgcj-app's `create-staff-account` and `update-staff-account`. See that repo's CLAUDE.md —
+  missing `create-staff-account` lets an admin mint a dispatcher who then cannot sign in at
+  all.
 - **`companies/`** — read-only roster view of onboarded companies (`components/companies/CompaniesDashboard.tsx`).
 - **`health/`** — system health checks against the mgcj project: pg_cron job status/failures, table bloat (`cron.job_run_details`/`net._http_response` — see the root CLAUDE.md's "Supabase DB size" note), and a set of ad hoc "detector" queries (`Detector` type) for data-consistency issues.
 - **`configuration/`** — `platform_settings` (legal name, business number, HST number, mailing address, payment instructions) — feeds directly into invoice PDFs, see below.
