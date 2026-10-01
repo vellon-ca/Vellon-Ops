@@ -108,3 +108,29 @@ export function validateTaxRate(rate: number): string | null {
   if (rate < 0 || rate > 100) return "Tax rate must be between 0 and 100.";
   return null;
 }
+
+export const TAX_LABEL_MAX = 16;
+
+/**
+ * Mirrors `companies_tax_label_check` (mgcj 20261001020000): length only, and
+ * deliberately no value whitelist. `HST` / `GST` would read like safety and
+ * would be a write-time failure the first time a company needs `GST + QST`.
+ *
+ * Note what cannot be validated anywhere: a label that is the wrong NAME for
+ * the rate beside it ('GST' at 14%) satisfies every constraint. That is what
+ * the preview is for.
+ */
+export function validateTaxLabel(label: string): string | null {
+  const l = label.trim();
+  if (!l) return "Tax label is required — it is printed on every receipt.";
+  if (l.length < 2 || l.length > TAX_LABEL_MAX)
+    return `Tax label must be 2–${TAX_LABEL_MAX} characters.`;
+  return null;
+}
+
+/** Exactly how the line reads on the passenger's receipt PDF. */
+export function taxLinePreview(label: string, rate: number): string {
+  const l = label.trim() || "HST";
+  const r = Number.isFinite(rate) ? String(Number(rate.toFixed(2))) : "?";
+  return `${l} (${r}%)`;
+}

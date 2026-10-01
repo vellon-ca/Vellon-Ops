@@ -8,7 +8,11 @@ export function buildInvoiceEmailHtml(params: {
   companyName: string;
   invoiceNumber: string;
   periodLabel: string;
+  /** The platform fee alone. `totalDue` is the payable figure. */
   amountDue: number;
+  /** NULL = no tax line, which is correct while Vellon is unregistered. */
+  tax: { label: string; ratePercent: number; amount: number } | null;
+  totalDue: number;
   cashFaresTotal: number;
   feePercent: number;
   rideCount: number;
@@ -20,6 +24,8 @@ export function buildInvoiceEmailHtml(params: {
     invoiceNumber,
     periodLabel,
     amountDue,
+    tax,
+    totalDue,
     cashFaresTotal,
     feePercent,
     rideCount,
@@ -42,7 +48,7 @@ export function buildInvoiceEmailHtml(params: {
 
     <div style="background: #f7f7f7; border-radius: 12px; padding: 20px; margin-bottom: 16px;">
       <p style="margin: 0 0 4px; font-size: 13px; color: #6B7280;">Amount due</p>
-      <p style="margin: 0; font-size: 32px; font-weight: 700; color: #1a1a1a;">$${amountDue.toFixed(2)}</p>
+      <p style="margin: 0; font-size: 32px; font-weight: 700; color: #1a1a1a;">$${totalDue.toFixed(2)}</p>
       <p style="margin: 4px 0 0; font-size: 13px; color: #6B7280;">Invoice ${invoiceNumber}</p>
     </div>
 
@@ -57,8 +63,17 @@ export function buildInvoiceEmailHtml(params: {
       </tr>
       <tr>
         <td style="padding: 8px 0; color: #6B7280; font-size: 13px;">Platform fee</td>
-        <td style="padding: 8px 0; font-size: 13px;">${feePercent}%</td>
+        <td style="padding: 8px 0; font-size: 13px;">${feePercent}% — $${amountDue.toFixed(2)}</td>
       </tr>
+      ${
+        tax
+          ? `
+      <tr>
+        <td style="padding: 8px 0; color: #6B7280; font-size: 13px;">${tax.label} (${formatRate(tax.ratePercent)}%)</td>
+        <td style="padding: 8px 0; font-size: 13px;">$${tax.amount.toFixed(2)}</td>
+      </tr>`
+          : ""
+      }
     </table>
 
     ${
@@ -84,4 +99,10 @@ export function buildInvoiceEmailHtml(params: {
     </div>
   </div>
   `;
+}
+
+// Same one-liner as the PDF builder and mgcj's send-ride-receipt: 14 rather
+// than 14.00, and one rate format across every document Vellon issues.
+function formatRate(percent: number): string {
+  return String(Number(percent.toFixed(2)));
 }
