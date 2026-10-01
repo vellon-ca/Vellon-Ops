@@ -11,6 +11,11 @@ import {
   type Spoke,
 } from "@/lib/connectors/spoke";
 import { writeAudit } from "@/lib/audit";
+import {
+  validateSlug,
+  validateSuffix,
+  validateTaxRate,
+} from "@/lib/companyIdentity";
 
 export type ActionResult<T> =
   | { ok: true; data: T }
@@ -29,6 +34,10 @@ export async function createCompany(
   billingAddress?: string;
   studentDiscountEnabled: boolean;
   studentDiscountPct?: number;
+  // Optional. Blank -> derived from the name by mgcj's trg_set_company_slug.
+  // Supplied -> used verbatim, because the slug is what the mobile build's
+  // COMPANY_SLUG resolves against.
+  slug?: string;
   // Set true to bypass the same-name guard (a genuinely distinct company that
   // happens to share a name with an existing one).
   force?: boolean;
@@ -64,10 +73,22 @@ export async function createCompany(
       };
   }
 
+  // The slug is OPTIONAL here and that is deliberate. Left empty, mgcj's
+  // trg_set_company_slug derives it from the name — which is what stops this
+  // INSERT failing with 23502, as it did from 20260929050000 until
+  // 20261001010000 (the column was made NOT NULL and backfilled, but a backfill
+  // is not a default). Supplied, it wins: the slug is what src/lib/brand.ts's
+  // COMPANY_SLUG resolves against, so for a company getting its own app build it
+  // should be chosen rather than derived from "M & G Cab Ltd".
+  const companySlug = input.slug?.trim().toLowerCase() || undefined;
+  const slugError = validateSlug(companySlug ?? "");
+  if (slugError) return { ok: false, error: slugError };
+
   const { data, error } = await mgcj
     .from("companies")
     .insert({
       name,
+      ...(companySlug ? { slug: companySlug } : {}),
       platform_fee_percent: input.platformFeePercent,
       base_fare: input.baseFare,
       rate_per_km: input.ratePerKm,
@@ -84,8 +105,16 @@ export async function createCompany(
     .select("id")
     .single();
 
-  if (error || !data)
+  if (error || !data) {
+    // The unique index is on lower(slug), so a chosen slug can collide with a
+    // company created earlier. 23505 here is a naming clash, not a fault.
+    if (error?.code === "23505")
+      return {
+        ok: false,
+        error: `The slug "${companySlug}" is already taken by another company. Choose a different one, or leave it blank to have one derived.`,
+      };
     return { ok: false, error: error?.message ?? "Failed to create company." };
+  }
 
   await writeAudit({
     actorUserId: owner.id,
@@ -589,6 +618,13 @@ export type CompanyDetail = CompanyRow & {
   hstNumber: string | null;
   billingEmail: string | null;
   billingAddress: string | null;
+  // Vellon-owned, never dispatcher-editable: a typo in either edits a document
+  // somebody relies on. `statementDescriptorSuffix` is what the passenger's bank
+  // statement reads after "VELLON INC.*"; `taxRatePercent` is the rate frozen
+  // onto each ride at completion and printed on the receipt.
+  slug: string;
+  statementDescriptorSuffix: string | null;
+  taxRatePercent: number;
 };
 
 export async function getCompanyForEdit(
@@ -602,7 +638,7 @@ export async function getCompanyForEdit(
   const { data: company, error } = await mgcj
     .from("companies")
     .select(
-      "id, name, platform_fee_percent, base_fare, rate_per_km, hst_number, billing_email, billing_address, stripe_account_id, stripe_onboarded",
+      "id, name, slug, platform_fee_percent, base_fare, rate_per_km, hst_number, billing_email, billing_address, statement_descriptor_suffix, tax_rate_percent, stripe_account_id, stripe_onboarded",
     )
     .eq("id", companyId)
     .maybeSingle();
@@ -644,6 +680,10 @@ export async function getCompanyForEdit(
       hstNumber: company.hst_number,
       billingEmail: company.billing_email,
       billingAddress: company.billing_address,
+      slug: company.slug as string,
+      statementDescriptorSuffix:
+        (company.statement_descriptor_suffix as string | null) ?? null,
+      taxRatePercent: Number(company.tax_rate_percent),
     },
   };
 }
@@ -659,6 +699,9 @@ export async function updateCompany(
   hstNumber?: string;
   billingEmail?: string;
   billingAddress?: string;
+  slug: string;
+  statementDescriptorSuffix?: string;
+  taxRatePercent: number;
   },
 ): Promise<ActionResult<{ companyId: string }>> {
   const owner = await requirePlatformOwner();
@@ -670,13 +713,27 @@ export async function updateCompany(
   if (input.baseFare < 0 || input.ratePerKm < 0)
     return { ok: false, error: "Fare values can't be negative." };
 
+  // Each mirrors a database constraint, so the worst case is a 23514/23505 we
+  // would otherwise surface as a raw Postgres string.
+  const companySlug = input.slug.trim().toLowerCase();
+  if (!companySlug) return { ok: false, error: "Slug is required." };
+  const slugError = validateSlug(companySlug);
+  if (slugError) return { ok: false, error: slugError };
+
+  const suffix = input.statementDescriptorSuffix?.trim() || null;
+  const suffixError = validateSuffix(suffix ?? "");
+  if (suffixError) return { ok: false, error: suffixError };
+
+  const taxError = validateTaxRate(input.taxRatePercent);
+  if (taxError) return { ok: false, error: taxError };
+
   const spoke = await loadSpoke(slug);
   const mgcj = spokeSupabase(spoke);
 
   const { data: before } = await mgcj
     .from("companies")
     .select(
-      "name, platform_fee_percent, base_fare, rate_per_km, hst_number, billing_email, billing_address",
+      "name, slug, platform_fee_percent, base_fare, rate_per_km, hst_number, billing_email, billing_address, statement_descriptor_suffix, tax_rate_percent",
     )
     .eq("id", input.companyId)
     .maybeSingle();
@@ -689,13 +746,28 @@ export async function updateCompany(
     hst_number: input.hstNumber?.trim() || null,
     billing_email: input.billingEmail?.trim() || null,
     billing_address: input.billingAddress?.trim() || null,
+    slug: companySlug,
+    statement_descriptor_suffix: suffix,
+    tax_rate_percent: input.taxRatePercent,
   };
 
+  // Note what this does NOT do: renaming a company does not re-derive its slug or
+  // its suffix. Both triggers are INSERT-only, on purpose — re-deriving the
+  // suffix would change the statement line for card holds already authorised
+  // under the old one, which is the value a passenger disputing a charge is
+  // comparing against. If a rename should move them, it is an explicit edit here.
   const { error } = await mgcj
     .from("companies")
     .update(after)
     .eq("id", input.companyId);
-  if (error) return { ok: false, error: error.message };
+  if (error) {
+    if (error.code === "23505")
+      return {
+        ok: false,
+        error: `The slug "${companySlug}" is already taken by another company.`,
+      };
+    return { ok: false, error: error.message };
+  }
 
   await writeAudit({
     actorUserId: owner.id,

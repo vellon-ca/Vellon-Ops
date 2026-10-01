@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState, useTransition } from "react";
+import { slugPreview } from "@/lib/companyIdentity";
 import { useSearchParams } from "next/navigation";
 import {
   createCompany,
@@ -24,6 +25,7 @@ const label = "block text-sm font-medium text-zinc-400";
 
 type CompanyInput = {
   name: string;
+  slug: string;
   platformFeePercent: number;
   baseFare: number;
   ratePerKm: number;
@@ -49,6 +51,8 @@ export function OnboardingWizard({ slug }: { slug: string }) {
   const [step, setStep] = useState(0);
   const [pending, startTransition] = useTransition();
   const [error, setError] = useState<string | null>(null);
+  // Only so the slug placeholder can show what the name would derive to.
+  const [namePreview, setNamePreview] = useState("");
 
   // carried state
   const [companyId, setCompanyId] = useState<string | null>(null);
@@ -128,6 +132,7 @@ export function OnboardingWizard({ slug }: { slug: string }) {
         hstNumber: data.hstNumber,
         billingEmail: data.billingEmail,
         billingAddress: data.billingAddress,
+        slug: data.slug,
         studentDiscountEnabled: false,
         force,
       });
@@ -197,6 +202,7 @@ export function OnboardingWizard({ slug }: { slug: string }) {
               submitCompany(
                 {
                   name: String(f.get("name")),
+                  slug: String(f.get("slug") || ""),
                   platformFeePercent: Number(f.get("fee")),
                   baseFare: Number(f.get("base")),
                   ratePerKm: Number(f.get("rate")),
@@ -210,7 +216,26 @@ export function OnboardingWizard({ slug }: { slug: string }) {
           >
             <div className="space-y-1.5">
               <label className={label}>Company name</label>
-              <input name="name" required className={input} />
+              <input
+                name="name"
+                required
+                className={input}
+                onChange={(e) => setNamePreview(e.target.value)}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <label className={label}>Slug (optional — derived if left blank)</label>
+              <input
+                name="slug"
+                placeholder={slugPreview(namePreview) || "m-g-cab"}
+                className={input}
+              />
+              <p className="text-xs text-zinc-500">
+                This is what the mobile build&rsquo;s COMPANY_SLUG resolves
+                against, so for a company getting its own app build, choose it —
+                the derived default from a legal name is valid but not what you
+                would pick. It can be changed later, but only in step with a build.
+              </p>
             </div>
             <div className="grid grid-cols-3 gap-3">
               <div className="space-y-1.5">
