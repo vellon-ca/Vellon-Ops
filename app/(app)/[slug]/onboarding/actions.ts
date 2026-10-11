@@ -8,6 +8,8 @@ import {
   spokeStripePost,
   spokeStripeGet,
   spokeStripeConfigured,
+  spokeStripeV2Get,
+  spokeStripeV2Post,
   type Spoke,
 } from "@/lib/connectors/spoke";
 import { writeAudit } from "@/lib/audit";
@@ -524,6 +526,222 @@ export async function refreshStripeStatus(
       detailsSubmitted: !!acct.details_submitted,
     },
   };
+}
+
+// ── Direct charges: the company's OWN Stripe account ────────────────
+// Design: mgcj-app/.claude/notes/direct-charges-design.md (§3, §11).
+//
+// Separate from the Express flow above, on separate columns
+// (stripe_direct_*). The live card flow still routes transfers off
+// stripe_account_id, so that flow and its columns stay as they are until
+// cutover.
+//
+// This is the ONLY place the account is created. Who pays Stripe's fees and
+// who owns a negative balance cannot be changed afterwards, so it is made
+// once, here, with the decided configuration — never from the dashboard.
+//
+// No setup link is minted here. A link lives five minutes, so it cannot be
+// sent to anyone; the owner opens the form from the dispatch dashboard
+// (Settings → Card payments), which mints one on the click.
+export type DirectAccountStatus = {
+  accountId: string | null;
+  // Stripe's capability words, verbatim ('active', 'pending', 'restricted', …).
+  card: string | null;
+  payouts: string | null;
+  // What the owner still has to provide, as Stripe's requirement codes. Entries
+  // Stripe is itself reviewing are left out, as in the dashboard.
+  outstanding: string[];
+  // What the cardholder's statement will read. Stripe takes it from the
+  // website the owner types into the form, so check it once they are done.
+  statementDescriptor: string | null;
+};
+
+const DIRECT_MIGRATION_MSG =
+  "This project is missing mgcj-app migration 20261012000000_direct_charge_account.sql.";
+
+type DirectCompany = {
+  name: string;
+  billing_email: string | null;
+  stripe_direct_account_id: string | null;
+  stripe_direct_card_status: string | null;
+  stripe_direct_payouts_status: string | null;
+};
+
+async function loadDirectCompany(
+  spoke: Spoke,
+  companyId: string,
+): Promise<{ company: DirectCompany } | { error: string }> {
+  const { data, error } = await spokeSupabase(spoke)
+    .from("companies")
+    .select(
+      "name, billing_email, stripe_direct_account_id, stripe_direct_card_status, stripe_direct_payouts_status",
+    )
+    .eq("id", companyId)
+    .maybeSingle();
+  if (error)
+    return { error: error.code === "42703" ? DIRECT_MIGRATION_MSG : error.message };
+  if (!data) return { error: "Company not found." };
+  return { company: data as DirectCompany };
+}
+
+// Reads the account at Stripe and writes the two status columns when they have
+// moved — the same sync the dashboard's company-card-setup function does, so a
+// check from either side leaves the row current.
+async function readDirectAccount(
+  spoke: Spoke,
+  companyId: string,
+  company: DirectCompany,
+): Promise<ActionResult<DirectAccountStatus>> {
+  const accountId = company.stripe_direct_account_id!;
+  // Capabilities and requirements come back ONLY when asked for with include=.
+  const acct = await spokeStripeV2Get(
+    spoke,
+    `/v2/core/accounts/${encodeURIComponent(accountId)}` +
+      "?include=configuration.merchant&include=requirements",
+  );
+  if (acct?.error)
+    return { ok: false, error: acct.error.message ?? "Could not load the Stripe account." };
+
+  const merchant = acct?.configuration?.merchant;
+  const card: string | null = merchant?.capabilities?.card_payments?.status ?? null;
+  const payouts: string | null =
+    merchant?.capabilities?.stripe_balance?.payouts?.status ?? null;
+  const entries: Array<{ description?: string; awaiting_action_from?: string }> =
+    acct?.requirements?.entries ?? [];
+
+  if (
+    card !== company.stripe_direct_card_status ||
+    payouts !== company.stripe_direct_payouts_status
+  ) {
+    await spokeSupabase(spoke)
+      .from("companies")
+      .update({
+        stripe_direct_card_status: card,
+        stripe_direct_payouts_status: payouts,
+        stripe_direct_synced_at: new Date().toISOString(),
+      })
+      .eq("id", companyId);
+  }
+
+  return {
+    ok: true,
+    data: {
+      accountId,
+      card,
+      payouts,
+      outstanding: entries
+        .filter((e) => e.awaiting_action_from !== "stripe")
+        .map((e) => e.description)
+        .filter((d): d is string => !!d),
+      statementDescriptor: merchant?.statement_descriptor?.descriptor ?? null,
+    },
+  };
+}
+
+export async function getDirectAccountStatus(
+  slug: string,
+  input: { companyId: string },
+): Promise<ActionResult<DirectAccountStatus>> {
+  await requirePlatformOwner();
+  const spoke = await loadSpoke(slug);
+  if (!spokeStripeConfigured(spoke))
+    return { ok: false, error: "Stripe secret key not configured." };
+
+  const loaded = await loadDirectCompany(spoke, input.companyId);
+  if ("error" in loaded) return { ok: false, error: loaded.error };
+  if (!loaded.company.stripe_direct_account_id)
+    return {
+      ok: true,
+      data: { accountId: null, card: null, payouts: null, outstanding: [], statementDescriptor: null },
+    };
+  return readDirectAccount(spoke, input.companyId, loaded.company);
+}
+
+export async function createDirectAccount(
+  slug: string,
+  input: { companyId: string },
+): Promise<ActionResult<DirectAccountStatus>> {
+  const owner = await requirePlatformOwner();
+  const spoke = await loadSpoke(slug);
+  if (!spokeStripeConfigured(spoke))
+    return { ok: false, error: "Stripe secret key not configured." };
+
+  const loaded = await loadDirectCompany(spoke, input.companyId);
+  if ("error" in loaded) return { ok: false, error: loaded.error };
+  const { company } = loaded;
+
+  // Re-running the step reads the account that exists; it never makes a second.
+  if (company.stripe_direct_account_id)
+    return readDirectAccount(spoke, input.companyId, company);
+
+  // Stripe writes to this address itself (it bills the company and chases
+  // missing documents), so it is not guessed from a staff login.
+  if (!company.billing_email)
+    return {
+      ok: false,
+      error: "Set the company's billing email first — Stripe contacts the owner there.",
+    };
+
+  // The idempotency key is the company, so a double click, or a retry after
+  // the write below failed, gets the SAME account back. A second account could
+  // not be merged or reconfigured, only abandoned.
+  const acct = await spokeStripeV2Post(
+    spoke,
+    "/v2/core/accounts",
+    {
+      display_name: company.name,
+      contact_email: company.billing_email,
+      // Config A: the company has a real Stripe login, Stripe bills it for
+      // processing and owns its negative balances. Fixed at creation.
+      dashboard: "full",
+      identity: { country: "ca", entity_type: "company" },
+      configuration: {
+        merchant: {
+          mcc: "4121", // taxicabs and limousines
+          capabilities: { card_payments: { requested: true } },
+        },
+      },
+      defaults: {
+        currency: "cad",
+        locales: ["en-CA"],
+        profile: {
+          doing_business_as: company.name,
+          product_description:
+            "Taxi service. Passengers pay their fare by card at the end of the ride.",
+        },
+        responsibilities: { fees_collector: "stripe", losses_collector: "stripe" },
+      },
+      metadata: { company_id: input.companyId },
+    },
+    `direct-account:${input.companyId}`,
+  );
+  if (acct?.error || !acct?.id)
+    return { ok: false, error: acct?.error?.message ?? "Stripe account create failed." };
+
+  const accountId = acct.id as string;
+  const { error: writeError } = await spokeSupabase(spoke)
+    .from("companies")
+    .update({ stripe_direct_account_id: accountId })
+    .eq("id", input.companyId)
+    .is("stripe_direct_account_id", null);
+  if (writeError)
+    return {
+      ok: false,
+      error: `Stripe account ${accountId} was created but could not be saved: ${writeError.message}. Run the step again — it will return the same account.`,
+    };
+
+  await writeAudit({
+    actorUserId: owner.id,
+    projectSlug: spoke.slug,
+    action: "stripe.direct_account_create",
+    target: input.companyId,
+    after: { stripe_direct_account_id: accountId },
+  });
+
+  return readDirectAccount(spoke, input.companyId, {
+    ...company,
+    stripe_direct_account_id: accountId,
+  });
 }
 
 // ── Companies list (completed + in-progress onboarding) ─────────────

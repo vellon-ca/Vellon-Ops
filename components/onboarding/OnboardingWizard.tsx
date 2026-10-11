@@ -16,6 +16,7 @@ import {
   type StripeStatus,
   type CompanyDetail,
 } from "@/app/(app)/[slug]/onboarding/actions";
+import { DirectAccountPanel } from "./DirectAccountPanel";
 
 const STEPS = ["Company", "Admin", "Dispatchers", "Invites", "Stripe", "Done"] as const;
 
@@ -617,6 +618,14 @@ export function OnboardingWizard({ slug }: { slug: string }) {
                   </>
                 )}
               </div>
+            )}
+
+            {companyId && (
+              <DirectAccountPanel
+                slug={slug}
+                companyId={companyId}
+                companyName={companyName}
+              />
             )}
 
             <div className="flex gap-2 pt-2">

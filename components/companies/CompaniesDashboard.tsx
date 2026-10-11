@@ -89,7 +89,7 @@ export function CompaniesDashboard({ slug }: { slug: string }) {
               <tr>
                 <td colSpan={7} className="px-4 py-6 text-center text-zinc-500">
                   No companies yet.{" "}
-                  <Link href="/onboarding" className="text-accent">
+                  <Link href={`/${slug}/onboarding`} className="text-accent">
                     Onboard one →
                   </Link>
                 </td>
@@ -139,7 +139,7 @@ export function CompaniesDashboard({ slug }: { slug: string }) {
                     <div className="flex items-center justify-end gap-2">
                       {incomplete && (
                         <Link
-                          href={`/onboarding?resume=${r.id}`}
+                          href={`/${slug}/onboarding?resume=${r.id}`}
                           className="rounded-md border border-zinc-700 px-3 py-1.5 text-xs text-zinc-300 hover:bg-zinc-800/50"
                         >
                           Resume onboarding →

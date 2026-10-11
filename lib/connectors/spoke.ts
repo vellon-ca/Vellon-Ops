@@ -159,6 +159,46 @@ export async function spokeStripeGet(spoke: Spoke, path: string) {
   return res.json();
 }
 
+// ── Stripe v2 (Accounts v2), for direct charges ─────────────────────
+// v2 is not v1 with a different path: the body is JSON, and Stripe-Version is
+// REQUIRED — there is no account default to fall back on. Field shapes move
+// between versions (account_links lost `configurations` after
+// 2026-06-24.dahlia), so the pin is part of the request, not a detail.
+// mgcj-app's supabase/functions/_shared/stripeV2.ts carries the same pin for
+// the setup link and status read; move the two together.
+export const STRIPE_V2_VERSION = "2026-09-30.endive";
+
+async function spokeStripeV2(
+  spoke: Spoke,
+  method: "GET" | "POST",
+  path: string,
+  body?: unknown,
+  idempotencyKey?: string,
+) {
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${stripeKey(spoke)}`,
+    "Stripe-Version": STRIPE_V2_VERSION,
+  };
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+  if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
+  const res = await fetch(`https://api.stripe.com${path}`, {
+    method,
+    headers,
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  return res.json();
+}
+
+export const spokeStripeV2Get = (spoke: Spoke, path: string) =>
+  spokeStripeV2(spoke, "GET", path);
+
+export const spokeStripeV2Post = (
+  spoke: Spoke,
+  path: string,
+  body: unknown,
+  idempotencyKey?: string,
+) => spokeStripeV2(spoke, "POST", path, body, idempotencyKey);
+
 // ── write gates ─────────────────────────────────────────────────────
 // Three tiers, keyed off spoke.environment. A flat "dev cannot write" would
 // remove the reason to have a dev spoke at all — the point is to exercise the
