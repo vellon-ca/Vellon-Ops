@@ -15,6 +15,7 @@ import {
   getRefundsByReason,
   searchRefundableRides,
   refundRide,
+  returnVellonFee,
   type RevenueSummary,
   type Invoice,
   type DisputeCosts,
@@ -164,7 +165,13 @@ export function RevenueDashboard({ slug }: { slug: string }) {
               label="Card fees"
               value={cad(rev.totals.cardFee)}
               dot={CARD}
-              sub={rev.totals.refunds > 0 ? "auto-collected, net of refunds" : "auto-collected"}
+              sub={
+                rev.totals.feeReturned > 0
+                  ? `auto-collected, net of ${cad(rev.totals.feeReturned)} returned to companies`
+                  : rev.totals.refunds > 0
+                    ? "auto-collected, net of refunds"
+                    : "auto-collected"
+              }
             />
             <Tile
               label="Cash fees"
@@ -174,6 +181,24 @@ export function RevenueDashboard({ slug }: { slug: string }) {
             />
             <Tile label="Completed rides" value={rev.totals.rides.toLocaleString()} />
           </div>
+
+          {/* Tax on the fee is a liability, so it sits apart from the fee tiles
+              and is in none of them. Hidden while the fee is untaxed. Shown when
+              negative too: returns can outweigh a range's tax, and that is a
+              credit owed back, not nothing. */}
+          {rev.totals.feeTax !== 0 && (
+            <div className={card}>
+              <div className="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-1">
+                <p className="text-sm text-zinc-400">GST/HST charged on fees</p>
+                <p className="text-lg font-semibold text-zinc-100">{cad(rev.totals.feeTax)}</p>
+              </div>
+              <p className="mt-1 text-xs text-zinc-500">
+                {cad(rev.totals.cardFeeTax)} collected with card fees, {cad(rev.totals.cashFeeTax)} billed
+                on cash invoices, net of tax on fees returned. Owed to the CRA and not included in the
+                fee figures above.
+              </p>
+            </div>
+          )}
 
           <FeeTrend data={rev.byMonth} />
 
@@ -253,6 +278,7 @@ export function RevenueDashboard({ slug }: { slug: string }) {
 const ROUTE_LABEL: Record<string, string> = {
   driver_transfer: "Paid to driver",
   company_transfer: "Paid to company",
+  direct: "Charged on company's account",
   platform_invoiced: "Held on platform",
   transfer_failed: "Transfer failed",
   transfer_reversed: "Reversed (dispute)",
@@ -276,7 +302,7 @@ const STATE_META: Record<
   paid_companies: {
     label: "Paid to companies",
     dot: "#3987e5",
-    sub: "company settles with drivers",
+    sub: "transferred, or charged on their own account",
   },
   held: {
     label: "Held / pending sweep",
@@ -1430,19 +1456,14 @@ function RefundsByReasonSection({
 
 // ── Refunds ─────────────────────────────────────────────────────────
 // Look up a passenger's completed card rides and issue a refund after
-// investigating a complaint. The reason chosen in the modal decides who
-// absorbs it (driver/company vs Vellon); the driver clawback, if any, runs a
-// moment later via mgcj's stripe-webhook. See refundRide in actions.ts.
+// investigating a complaint. Only for the few rides charged on Vellon's own
+// account before direct charges; Vellon absorbs every refund it issues here.
+// A direct charge is refunded by the company from its dashboard.
 const REASON_OPTIONS: {
   value: RefundReason;
   label: string;
   blurb: string;
 }[] = [
-  {
-    value: "driver_fault",
-    label: "Driver / company at fault",
-    blurb: "Clawed back from the driver's payout, driver-first. Vellon keeps its fee.",
-  },
   {
     value: "platform_mistake",
     label: "Platform mistake",
@@ -1470,6 +1491,9 @@ function RefundSection({ slug }: { slug: string }) {
   const [error, setError] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
   const [active, setActive] = useState<RefundableRide | null>(null); // ride being refunded
+  // Returning a fee moves money, so it takes two presses: the first arms the
+  // row, the second sends it.
+  const [armedFee, setArmedFee] = useState<string | null>(null);
   const [pending, startTransition] = useTransition();
 
   const search = useCallback(() => {
@@ -1482,13 +1506,33 @@ function RefundSection({ slug }: { slug: string }) {
     });
   }, [phone]);
 
+  const returnFee = (r: RefundableRide) => {
+    setError(null);
+    setNote(null);
+    startTransition(async () => {
+      const res = await returnVellonFee(slug, { rideId: r.id });
+      setArmedFee(null);
+      if (!res.ok) {
+        setError(res.error);
+        return;
+      }
+      setNote(
+        `Returned ${cad(res.returnedCents / 100)} to ${r.companyName}` +
+          (res.taxCents > 0 ? ` (includes ${cad(res.taxCents / 100)} tax).` : "."),
+      );
+      const again = await searchRefundableRides(slug, { phone });
+      if (again.ok) setRides(again.data);
+    });
+  };
+
   return (
     <section>
       <h2 className="text-sm font-semibold text-zinc-300">Refunds</h2>
       <p className="mt-1 text-xs text-zinc-500">
         Look up a passenger&apos;s completed card rides by phone and issue a
         refund. Cash rides aren&apos;t refundable here — they&apos;re invoiced
-        monthly.
+        monthly. A fare charged on the company&apos;s own Stripe account is the
+        company&apos;s to refund; what Vellon can give back on it is its own fee.
       </p>
 
       <div className="mt-3 flex flex-wrap items-center gap-2">
@@ -1558,6 +1602,41 @@ function RefundSection({ slug }: { slug: string }) {
                       >
                         Refund
                       </button>
+                    ) : r.feeCents != null ? (
+                      r.feeReturnedAt ? (
+                        <span className="text-xs text-zinc-500">
+                          Fee returned {fmtDate(r.feeReturnedAt)} ({cad(r.feeCents / 100)})
+                        </span>
+                      ) : armedFee === r.id ? (
+                        <span className="inline-flex items-center gap-2">
+                          <button
+                            onClick={() => returnFee(r)}
+                            disabled={pending}
+                            className="rounded-md border border-amber-700 bg-amber-950/40 px-2.5 py-1 text-xs text-amber-200 hover:bg-amber-950/70 disabled:opacity-50"
+                          >
+                            {pending ? "…" : `Confirm: return ${cad(r.feeCents / 100)}`}
+                          </button>
+                          <button
+                            onClick={() => setArmedFee(null)}
+                            disabled={pending}
+                            className="text-xs text-zinc-500 hover:text-zinc-300"
+                          >
+                            Cancel
+                          </button>
+                        </span>
+                      ) : (
+                        <button
+                          onClick={() => setArmedFee(r.id)}
+                          title={
+                            r.feeTaxCents > 0
+                              ? `Vellon's fee ${cad((r.feeCents - r.feeTaxCents) / 100)} + ${cad(r.feeTaxCents / 100)} tax, back to the company. The passenger's fare is not touched.`
+                              : "Vellon's fee, back to the company. The passenger's fare is not touched."
+                          }
+                          className="rounded-md border border-amber-800/60 px-2.5 py-1 text-xs text-amber-300 hover:bg-amber-950/40"
+                        >
+                          Return Vellon&apos;s fee
+                        </button>
+                      )
                     ) : (
                       <span className="text-xs text-zinc-600" title={r.blockedReason ?? ""}>
                         {r.blockedReason ?? "—"}
@@ -1631,10 +1710,7 @@ function RefundModal({
         return;
       }
       onDone(
-        `Refunded ${cad(res.amountCents / 100)}` +
-          (res.clawback
-            ? " — the driver/company clawback will complete via Stripe shortly."
-            : " — absorbed by Vellon."),
+        `Refunded ${cad(res.amountCents / 100)} — absorbed by Vellon.`,
       );
     });
   };

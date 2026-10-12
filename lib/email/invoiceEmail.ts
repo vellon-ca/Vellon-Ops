@@ -11,7 +11,7 @@ export function buildInvoiceEmailHtml(params: {
   /** The platform fee alone. `totalDue` is the payable figure. */
   amountDue: number;
   /** NULL = no tax line, which is correct while Vellon is unregistered. */
-  tax: { label: string; ratePercent: number; amount: number } | null;
+  tax: { label: string; ratePercent: number | null; amount: number } | null;
   totalDue: number;
   cashFaresTotal: number;
   feePercent: number;
@@ -69,7 +69,7 @@ export function buildInvoiceEmailHtml(params: {
         tax
           ? `
       <tr>
-        <td style="padding: 8px 0; color: #6B7280; font-size: 13px;">${tax.label} (${formatRate(tax.ratePercent)}%)</td>
+        <td style="padding: 8px 0; color: #6B7280; font-size: 13px;">${tax.label}${tax.ratePercent != null ? ` (${formatRate(tax.ratePercent)}%)` : ""}</td>
         <td style="padding: 8px 0; font-size: 13px;">$${tax.amount.toFixed(2)}</td>
       </tr>`
           : ""

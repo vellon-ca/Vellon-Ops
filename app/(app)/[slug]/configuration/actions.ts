@@ -3,14 +3,7 @@
 import { requirePlatformOwner } from "@/lib/auth/guard";
 import { supabaseAdmin } from "@/lib/supabase/admin";
 import { writeAudit } from "@/lib/audit";
-import {
-  loadSpoke,
-  spokeSupabase,
-  spokeStripeGet,
-  spokeStripePost,
-  spokeStripeConfigured,
-  type Spoke,
-} from "@/lib/connectors/spoke";
+import { loadSpoke, spokeSupabase } from "@/lib/connectors/spoke";
 
 export type PlatformSettings = {
   legalName: string | null;
@@ -88,170 +81,140 @@ export async function updatePlatformSettings(
   return { ok: true, data: input };
 }
 
-// ── Payout timing config ─────────────────────────────────────────────
-// Lives in the mgcj (spoke) project's payout_config table so mgcj's
-// create-connect-account edge function can read it directly. We reach it via
-// the service-role connector, and (per Victor's call) also push the values to
-// every existing Stripe connected account on save — drivers vs companies told
-// apart by whether the account carries a supabase_user_id in its metadata.
+// ── Tax on Vellon's fee ──────────────────────────────────────────────
+// The switch lives in the SPOKE (mgcj platform_fee_tax, migration
+// 20261013000000): card capture reads it there, and so does ops_revenue, which
+// the invoice generator sums. One switch per project, so dev can be
+// "registered" for testing while prod is not. The hst_number above is only the
+// number PRINTED on the document — it gates nothing.
+//
+// A spoke-only write, so no hub tier applies (lib/connectors/spoke.ts): a dev
+// spoke's switch taxes dev rides and nothing else.
 
-export type PayoutConfig = {
-  driverDelayDays: number;
-  companyDelayDays: number;
+export type FeeTaxConfig = {
+  /** 'YYYY-MM-DD' in Atlantic time, or null when the fee is not taxed. */
+  registeredFromDate: string | null;
+  /** True once that instant has passed. */
+  active: boolean;
 };
 
-export type PayoutPushSummary = {
-  updated: number;   // accounts set to exactly the requested value
-  flooredToStripeMin: number; // accounts Stripe floored above our target
-  failed: number;    // accounts that errored for some other reason
-  skipped: boolean;  // Stripe not configured -> DB saved, no push attempted
-};
+const ATLANTIC = "America/Halifax";
 
-const DAYS_MIN = 0;
-const DAYS_MAX = 31;
-
-function clampDays(n: unknown): number | null {
-  const v = Math.trunc(Number(n));
-  if (!Number.isFinite(v) || v < DAYS_MIN || v > DAYS_MAX) return null;
-  return v;
+// 'YYYY-MM-DD' in Atlantic time for an instant.
+function atlanticDate(iso: string): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: ATLANTIC,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date(iso));
 }
 
-export async function getPayoutConfig(
-  slug: string,
-): Promise<Result<PayoutConfig>> {
+// The instant an Atlantic calendar day starts. The offset is read for that
+// day rather than assumed: it is -03:00 in summer and -04:00 in winter.
+function atlanticMidnight(date: string): string {
+  const guess = new Date(`${date}T04:00:00Z`);
+  const offset =
+    new Intl.DateTimeFormat("en-CA", { timeZone: ATLANTIC, timeZoneName: "longOffset" })
+      .formatToParts(guess)
+      .find((p) => p.type === "timeZoneName")
+      ?.value.replace("GMT", "") || "-04:00";
+  return new Date(`${date}T00:00:00${offset}`).toISOString();
+}
+
+function toConfig(registeredFrom: string | null): FeeTaxConfig {
+  return {
+    registeredFromDate: registeredFrom ? atlanticDate(registeredFrom) : null,
+    active: !!registeredFrom && new Date(registeredFrom).getTime() <= Date.now(),
+  };
+}
+
+export async function getFeeTax(slug: string): Promise<Result<FeeTaxConfig>> {
   await requirePlatformOwner();
   const spoke = await loadSpoke(slug);
-
   const { data, error } = await spokeSupabase(spoke)
-    .from("payout_config")
-    .select("driver_delay_days, company_delay_days")
+    .from("platform_fee_tax")
+    .select("registered_from")
     .eq("id", 1)
     .maybeSingle();
-  if (error) return { ok: false, error: error.message };
-
-  return {
-    ok: true,
-    data: {
-      driverDelayDays: data?.driver_delay_days ?? 2,
-      companyDelayDays: data?.company_delay_days ?? 2,
-    },
-  };
+  if (error) {
+    return {
+      ok: false,
+      error:
+        `Could not read the fee-tax switch on "${spoke.name}" (${error.message}). ` +
+        `It needs mgcj migration 20261013000000_fee_tax.sql applied to that project.`,
+    };
+  }
+  return { ok: true, data: toConfig((data?.registered_from as string | null) ?? null) };
 }
 
-// Set one account's automatic payout delay. Stripe floors delay_days at the
-// account's country minimum (~2-3 business days for CA); if it rejects our
-// target as too low, retry letting Stripe pick its own minimum so the account
-// still lands as fast as allowed rather than erroring. Returns which happened.
-async function applyDelayToAccount(
-  spoke: Spoke,
-  accountId: string,
-  days: number,
-): Promise<"updated" | "floored" | "failed"> {
-  const res = await spokeStripePost(spoke, `/accounts/${accountId}`, {
-    "settings[payouts][schedule][interval]": "daily",
-    "settings[payouts][schedule][delay_days]": String(days),
-  });
-  if (!res.error) return "updated";
-
-  if (String(res.error?.param ?? "").includes("delay_days")) {
-    // Below the country floor — set interval only, let Stripe apply its min.
-    const retry = await spokeStripePost(spoke, `/accounts/${accountId}`, {
-      "settings[payouts][schedule][interval]": "daily",
-    });
-    return retry.error ? "failed" : "floored";
-  }
-  return "failed";
-}
-
-async function pushDelaysToStripe(
-  spoke: Spoke,
-  cfg: PayoutConfig,
-): Promise<PayoutPushSummary> {
-  const summary: PayoutPushSummary = {
-    updated: 0,
-    flooredToStripeMin: 0,
-    failed: 0,
-    skipped: false,
-  };
-
-  if (!spokeStripeConfigured(spoke)) {
-    summary.skipped = true;
-    return summary;
-  }
-
-  // Page through all connected accounts (the platform has a handful today).
-  let startingAfter: string | undefined;
-  for (let page = 0; page < 20; page++) {
-    const qs = new URLSearchParams({ limit: "100" });
-    if (startingAfter) qs.set("starting_after", startingAfter);
-    const list = await spokeStripeGet(spoke, `/accounts?${qs.toString()}`);
-    if (list.error || !Array.isArray(list.data)) break;
-
-    for (const acct of list.data) {
-      // A driver's own Express account is stamped with supabase_user_id at
-      // creation (see create-connect-account); a company account isn't.
-      const isDriver = Boolean(acct?.metadata?.supabase_user_id);
-      const days = isDriver ? cfg.driverDelayDays : cfg.companyDelayDays;
-      const outcome = await applyDelayToAccount(spoke, acct.id, days);
-      if (outcome === "updated") summary.updated++;
-      else if (outcome === "floored") summary.flooredToStripeMin++;
-      else summary.failed++;
-    }
-
-    if (!list.has_more || list.data.length === 0) break;
-    startingAfter = list.data[list.data.length - 1].id;
-  }
-
-  return summary;
-}
-
-export async function updatePayoutConfig(
+export async function updateFeeTax(
   slug: string,
-  input: PayoutConfig,
-): Promise<Result<{ config: PayoutConfig; push: PayoutPushSummary }>> {
+  input: { registeredFromDate: string | null },
+): Promise<Result<FeeTaxConfig>> {
   const owner = await requirePlatformOwner();
   const spoke = await loadSpoke(slug);
 
-  const driverDelayDays = clampDays(input.driverDelayDays);
-  const companyDelayDays = clampDays(input.companyDelayDays);
-  if (driverDelayDays === null || companyDelayDays === null) {
-    return { ok: false, error: `Delay days must be whole numbers between ${DAYS_MIN} and ${DAYS_MAX}.` };
+  let registeredFrom: string | null = null;
+  if (input.registeredFromDate) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(input.registeredFromDate)) {
+      return { ok: false, error: "Enter the date as YYYY-MM-DD." };
+    }
+    registeredFrom = atlanticMidnight(input.registeredFromDate);
+    if (Number.isNaN(new Date(registeredFrom).getTime())) {
+      return { ok: false, error: "That is not a real date." };
+    }
+    // Production charges real companies real tax from this date, on documents
+    // that must carry the number. Refuse to turn it on without one — and
+    // refuse a PAST date: a ride's rate is frozen when it completes, so rides
+    // between that date and now would stay untaxed while the date says Vellon
+    // owed tax on them. Set the date before it arrives.
+    if (spoke.environment === "prod") {
+      if (input.registeredFromDate < atlanticDate(new Date().toISOString())) {
+        return {
+          ok: false,
+          error:
+            "That date has passed. Rides already completed since then were not taxed and " +
+            "cannot be taxed now, so production only accepts today or a future date.",
+        };
+      }
+      const { data: settings } = await supabaseAdmin
+        .from("platform_settings")
+        .select("hst_number")
+        .eq("id", 1)
+        .maybeSingle();
+      if (!settings?.hst_number) {
+        return {
+          ok: false,
+          error: "Enter Vellon's GST/HST number above before turning fee tax on for production.",
+        };
+      }
+    }
   }
 
   const mgcj = spokeSupabase(spoke);
-
   const { data: before } = await mgcj
-    .from("payout_config")
-    .select("driver_delay_days, company_delay_days")
+    .from("platform_fee_tax")
+    .select("registered_from")
     .eq("id", 1)
     .maybeSingle();
 
-  const after = {
-    driver_delay_days: driverDelayDays,
-    company_delay_days: companyDelayDays,
+  const { error } = await mgcj.from("platform_fee_tax").upsert({
+    id: 1,
+    registered_from: registeredFrom,
     updated_at: new Date().toISOString(),
     updated_by: owner.id,
-  };
-
-  // Upsert the singleton (row is seeded by migration, but be resilient).
-  const { error } = await mgcj
-    .from("payout_config")
-    .upsert({ id: 1, ...after });
+  });
   if (error) return { ok: false, error: error.message };
-
-  // Push to existing Stripe accounts. A push failure must NOT lose the saved
-  // config — it's already persisted above — so we surface it in the summary
-  // rather than throwing.
-  const push = await pushDelaysToStripe(spoke, { driverDelayDays, companyDelayDays });
 
   await writeAudit({
     actorUserId: owner.id,
     projectSlug: spoke.slug,
-    action: "payout_config.update",
-    target: "payout_config",
+    action: "platform_fee_tax.update",
+    target: "platform_fee_tax",
     before,
-    after: { ...after, _stripe_push: push },
+    after: { registered_from: registeredFrom },
   });
 
-  return { ok: true, data: { config: { driverDelayDays, companyDelayDays }, push } };
+  return { ok: true, data: toConfig(registeredFrom) };
 }

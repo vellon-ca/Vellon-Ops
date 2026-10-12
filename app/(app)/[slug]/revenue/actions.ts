@@ -15,7 +15,7 @@ import {
 import { supabaseAdmin } from "@/lib/supabase/admin";
 import { writeAudit } from "@/lib/audit";
 import { getPlatformSettings } from "@/app/(app)/[slug]/configuration/actions";
-import { buildInvoicePdf } from "@/lib/pdf/invoice";
+import { buildInvoicePdf, type InvoiceTaxLine } from "@/lib/pdf/invoice";
 import { buildInvoiceEmailHtml } from "@/lib/email/invoiceEmail";
 
 const RESEND_FROM_ADDRESS = "Vellon <billing@vellon.ca>";
@@ -67,6 +67,9 @@ type RevRow = {
   fares_total: number;
   fee_total: number;
   refund_total: number; // Vellon's realized loss from refunds (card-only)
+  // GST/HST on fee_total, summed per ride on the spoke. 0 while Vellon's fee is
+  // untaxed, and on a spoke that predates mgcj 20261013000000.
+  fee_tax_total: number;
 };
 
 export type RevenueSummary = {
@@ -78,7 +81,16 @@ export type RevenueSummary = {
     cardFee: number; // NET of refunds (refunds are card-only)
     cashFee: number;
     refunds: number; // realized refund loss, netted out of fee/cardFee above
+    // Vellon's fee handed back to companies (fee only, no tax), by date of
+    // return. Also netted out of fee/cardFee above; its tax out of the tax below.
+    feeReturned: number;
     rides: number;
+    // GST/HST charged on the fee. Owed to the CRA, never revenue, so it is in
+    // none of the fee figures above. Card tax is already in hand (it rode in on
+    // the application fee); cash tax is billed on the monthly document.
+    feeTax: number;
+    cardFeeTax: number;
+    cashFeeTax: number;
   };
   byCompany: {
     companyId: string;
@@ -116,7 +128,57 @@ async function fetchRevRows(
     fares_total: Number(r.fares_total),
     fee_total: Number(r.fee_total),
     refund_total: Number(r.refund_total ?? 0),
+    fee_tax_total: Number(r.fee_tax_total ?? 0),
   }));
+}
+
+// Vellon's fee returned to a company (mgcj 20261013010000), one row per
+// company × month OF THE RETURN. `fee` excludes the tax; `tax` is the GST/HST
+// that went back with it. Read by both the revenue rollup and the invoice
+// generator so the screen and the document cannot bucket a return differently.
+// A spoke that predates the migration has no such column and no returns.
+type FeeReturn = {
+  companyId: string;
+  companyName: string;
+  month: string;
+  fee: number;
+  tax: number;
+  count: number;
+};
+
+async function fetchFeeReturns(
+  spoke: Spoke,
+  fromISO: string,
+  toISO: string,
+): Promise<FeeReturn[]> {
+  const { data, error } = await spokeSupabase(spoke)
+    .from("rides")
+    .select(
+      "company_id, application_fee_returned_at, application_fee_returned_cents, application_fee_tax_returned_cents, companies(name)",
+    )
+    .gte("application_fee_returned_at", fromISO)
+    .lt("application_fee_returned_at", toISO);
+  if (error) {
+    if (error.code === "42703" || isMissingSchema(error)) return [];
+    throw new Error(error.message);
+  }
+  const out = new Map<string, FeeReturn>();
+  for (const r of data ?? []) {
+    const month = `${String(r.application_fee_returned_at).slice(0, 7)}-01`;
+    const key = `${r.company_id}|${month}`;
+    // supabase-js types a to-one embed as an array; at runtime it is one object.
+    const co = r.companies as unknown as { name: string } | { name: string }[] | null;
+    const companyName = (Array.isArray(co) ? co[0]?.name : co?.name) ?? "Unknown company";
+    const e =
+      out.get(key) ?? { companyId: r.company_id, companyName, month, fee: 0, tax: 0, count: 0 };
+    const total = Number(r.application_fee_returned_cents ?? 0);
+    const tax = Number(r.application_fee_tax_returned_cents ?? 0);
+    e.fee += (total - tax) / 100;
+    e.tax += tax / 100;
+    e.count += 1;
+    out.set(key, e);
+  }
+  return [...out.values()];
 }
 
 // Contiguous list of UTC month-firsts ('YYYY-MM-01') in [fromISO, toISO). Used
@@ -160,7 +222,10 @@ export async function getRevenue(
   try {
     const rows = await fetchRevRows(spoke, input.fromISO, input.toISO);
 
-    const totals = { fares: 0, fee: 0, cardFee: 0, cashFee: 0, refunds: 0, rides: 0 };
+    const totals = {
+      fares: 0, fee: 0, cardFee: 0, cashFee: 0, refunds: 0, rides: 0,
+      feeTax: 0, cardFeeTax: 0, cashFeeTax: 0, feeReturned: 0,
+    };
     const companies = new Map<string, RevenueSummary["byCompany"][number]>();
     const months = new Map<string, RevenueSummary["byMonth"][number]>();
 
@@ -174,8 +239,14 @@ export async function getRevenue(
       totals.fee += netFee;
       totals.refunds += r.refund_total;
       totals.rides += r.ride_count;
-      if (isCard) totals.cardFee += netFee;
-      else totals.cashFee += netFee;
+      totals.feeTax += r.fee_tax_total;
+      if (isCard) {
+        totals.cardFee += netFee;
+        totals.cardFeeTax += r.fee_tax_total;
+      } else {
+        totals.cashFee += netFee;
+        totals.cashFeeTax += r.fee_tax_total;
+      }
 
       const c =
         companies.get(r.company_id) ??
@@ -204,6 +275,39 @@ export async function getRevenue(
       months.set(r.month, mo);
     }
 
+    // Returned fees come off in the month of the RETURN, not the ride's — the
+    // same month the company's document shows them. A month can therefore go
+    // negative (a return with no card rides beside it); that is the truth.
+    for (const f of await fetchFeeReturns(spoke, input.fromISO, input.toISO)) {
+      totals.fee -= f.fee;
+      totals.cardFee -= f.fee;
+      totals.feeReturned += f.fee;
+      totals.feeTax -= f.tax;
+      totals.cardFeeTax -= f.tax;
+      // A company with a return and no rides in the range still gets a row, or
+      // the table would stop adding up to the tiles.
+      const c =
+        companies.get(f.companyId) ??
+        {
+          companyId: f.companyId,
+          companyName: f.companyName,
+          cardFee: 0,
+          cashFee: 0,
+          totalFee: 0,
+          rides: 0,
+          fares: 0,
+        };
+      c.totalFee -= f.fee;
+      c.cardFee -= f.fee;
+      companies.set(f.companyId, c);
+      const mo =
+        months.get(f.month) ??
+        { month: f.month, cardFee: 0, cashFee: 0, totalFee: 0 };
+      mo.totalFee -= f.fee;
+      mo.cardFee -= f.fee;
+      months.set(f.month, mo);
+    }
+
     const fix = (n: number) => round2(n);
     return {
       ok: true,
@@ -216,7 +320,11 @@ export async function getRevenue(
           cardFee: fix(totals.cardFee),
           cashFee: fix(totals.cashFee),
           refunds: fix(totals.refunds),
+          feeReturned: fix(totals.feeReturned),
           rides: totals.rides,
+          feeTax: fix(totals.feeTax),
+          cardFeeTax: fix(totals.cardFeeTax),
+          cashFeeTax: fix(totals.cashFeeTax),
         },
         byCompany: [...companies.values()]
           .map((c) => ({
@@ -273,6 +381,11 @@ export type SettlementState =
 const ROUTE_STATE: Record<string, SettlementState> = {
   driver_transfer: "paid_drivers",
   company_transfer: "paid_companies",
+  // Derived by ops_settlement_reconciliation, never stored: the ride was
+  // charged on the company's OWN Stripe account (direct charge). Nothing was
+  // transferred; the amount is what the company kept there after Vellon's
+  // application fee and Stripe's processing cost.
+  direct: "paid_companies",
   platform_invoiced: "held",
   transfer_reversed: "reversed",
   refund_reversed: "reversed",
@@ -473,6 +586,19 @@ export type Invoice = {
   tax_rate_percent: number | null;
   tax_amount: number | null;
   total_due: number | null;
+  // 0009_invoice_card_section.sql. Vellon's fee on CARD fares, already
+  // collected through Stripe — shown on the document, never payable. NULL on
+  // rows generated before 0009.
+  card_fares_total: number | null;
+  card_fee_total: number | null;
+  card_tax_amount: number | null;
+  card_ride_count: number | null;
+  // Fees Vellon RETURNED to the company during this period (by date of return,
+  // whatever month the ride was in). card_fee_total / card_tax_amount above
+  // stay as collected; these are the credit against them.
+  card_fee_returned: number | null;
+  card_tax_returned: number | null;
+  card_fee_return_count: number | null;
 };
 
 export async function listInvoices(
@@ -525,23 +651,60 @@ export async function generateInvoices(
     return { ok: false, error: (e as Error).message };
   }
 
-  // Cash fees per company for the month (RPC already groups by month/method,
-  // but sum defensively in case of any boundary duplication).
+  // Fees per company for the month, cash and card apart (the RPC already
+  // groups by month/method, but sum defensively in case of any boundary
+  // duplication). Cash is what the invoice bills; card was collected through
+  // Stripe at capture and is only stated.
+  type Side = { fares: number; fee: number; tax: number; rides: number };
   const perCompany = new Map<
     string,
-    { name: string; feePct: number; fares: number; feeTotal: number; rides: number }
+    { name: string; feePct: number; cash: Side; card: Side }
   >();
   for (const r of rows) {
-    if (r.payment_method !== "cash") continue;
+    const side = r.payment_method === "cash" ? "cash" : r.payment_method === "card" ? "card" : null;
+    if (!side) continue;
     const e =
       perCompany.get(r.company_id) ??
-      { name: r.company_name, feePct: r.fee_percent, fares: 0, feeTotal: 0, rides: 0 };
-    e.fares += r.fares_total;
-    e.feeTotal += r.fee_total;
-    e.rides += r.ride_count;
-    e.feePct = r.fee_percent;
+      {
+        name: r.company_name,
+        feePct: r.fee_percent,
+        cash: { fares: 0, fee: 0, tax: 0, rides: 0 },
+        card: { fares: 0, fee: 0, tax: 0, rides: 0 },
+      };
+    e[side].fares += r.fares_total;
+    e[side].fee += r.fee_total;
+    e[side].tax += r.fee_tax_total;
+    e[side].rides += r.ride_count;
+    if (side === "cash") e.feePct = r.fee_percent;
     e.name = r.company_name;
     perCompany.set(r.company_id, e);
+  }
+
+  // Fees returned during the month. A company with a return and no rides this
+  // month still gets a document: the return is what it needs to adjust its
+  // input tax credit by.
+  let returns: FeeReturn[];
+  try {
+    returns = await fetchFeeReturns(spoke, start, next);
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
+  }
+  const returnedBy = new Map(returns.map((f) => [f.companyId, f]));
+  const unseen = returns.filter((f) => !perCompany.has(f.companyId)).map((f) => f.companyId);
+  if (unseen.length > 0) {
+    const { data: cs, error: cErr } = await spokeSupabase(spoke)
+      .from("companies")
+      .select("id, name, platform_fee_percent")
+      .in("id", unseen);
+    if (cErr) return { ok: false, error: cErr.message };
+    for (const c of cs ?? []) {
+      perCompany.set(c.id, {
+        name: c.name ?? returnedBy.get(c.id)?.companyName ?? "Unknown company",
+        feePct: Number(c.platform_fee_percent ?? 0),
+        cash: { fares: 0, fee: 0, tax: 0, rides: 0 },
+        card: { fares: 0, fee: 0, tax: 0, rides: 0 },
+      });
+    }
   }
 
   // Existing invoices for the month — skip regenerating locked (sent/paid) ones.
@@ -558,21 +721,34 @@ export async function generateInvoices(
 
   // ── Tax on the fee ────────────────────────────────────────────────────
   //
-  // TWO independent gates, one join apart (0008_invoice_tax.sql):
-  //   whether the FEE is taxed -> VELLON's registration (platform_settings)
-  //   whether the FARE is taxed -> the COMPANY's (mgcj companies.hst_number)
-  // Only the first one belongs here. As of 2026-10-01 Vellon is not
-  // registered, so every invoice generated today correctly carries no tax.
+  // WHETHER and HOW MUCH is decided on the spoke, per ride (mgcj
+  // 20261013000000): platform_fee_tax is the one switch card capture and this
+  // generator both read, and ops_revenue returns the per-ride tax already
+  // summed. Nothing is multiplied here — with a registration date inside the
+  // month only some rides carry tax, and round(fee x rate) would tax them all.
   //
-  // The RATE is the recipient's: a B2B service is rated at the customer's
-  // place of supply, so it comes from the billed company's jurisdiction, not
-  // Vellon's. Snapshotted onto the row below so the PDF never reads it live.
+  // platform_settings.hst_number is only the NUMBER PRINTED. So tax with no
+  // number is refused rather than issued: a tax line without the supplier's
+  // registration number is not a document the company can claim from.
   const settingsRes = await getPlatformSettings();
   if (!settingsRes.ok) return { ok: false, error: settingsRes.error };
-  const vellonRegistered = !!settingsRes.data.hstNumber;
+  const anyTax =
+    [...perCompany.values()].some((e) => e.cash.tax > 0 || e.card.tax > 0) ||
+    returns.some((f) => f.tax > 0);
+  if (anyTax && !settingsRes.data.hstNumber) {
+    return {
+      ok: false,
+      error:
+        "Fee tax was charged on rides this month, but Vellon's GST/HST number is " +
+        "empty. Enter it under Configuration, then generate again.",
+    };
+  }
 
+  // Label and nominal rate, for the document's tax line. The recipient's: a
+  // B2B service is rated at the customer's place of supply. Snapshotted onto
+  // the row so the PDF never reads it live.
   const taxByCompany = new Map<string, { label: string; ratePercent: number }>();
-  if (vellonRegistered) {
+  if (anyTax) {
     const mgcj = spokeSupabase(spoke);
     const { data: taxRows, error: taxErr } = await mgcj
       .from("companies")
@@ -586,31 +762,6 @@ export async function generateInvoices(
     }
   }
 
-  // Registered Vellon, unreadable rate: issue the invoice with NO tax line and
-  // say so loudly, rather than inventing a rate onto a tax document. Same call
-  // as send-ride-receipt makes in the mirror situation — and the cost lands on
-  // Vellon's own margin here, not on a false claim to a customer.
-  const taxFor = (companyId: string, fee: number) => {
-    if (!vellonRegistered) return null;
-    const t = taxByCompany.get(companyId);
-    if (!t) {
-      console.error(
-        `[generateInvoices] company ${companyId}: Vellon is tax-registered but ` +
-        `the company has no usable tax_rate_percent on spoke ${spoke.slug} — ` +
-        `invoicing the fee with NO tax line. Check that mgcj 20260930000000 and ` +
-        `20261001020000 are applied to that project.`,
-      );
-      return null;
-    }
-    return {
-      label: t.label,
-      ratePercent: t.ratePercent,
-      // EXCLUSIVE: on top of the fee, not extracted from it. Rounded once,
-      // here, and stored as the figure the document prints.
-      amount: round2(fee * (t.ratePercent / 100)),
-    };
-  };
-
   // Deterministic — same company/month always yields the same number, so
   // regenerating a draft never reassigns it.
   const yyyymm = first.slice(0, 4) + first.slice(5, 7);
@@ -618,29 +769,47 @@ export async function generateInvoices(
     `INV-${yyyymm}-${companyId.slice(0, 6)}`;
 
   const toUpsert = [...perCompany.entries()]
-    .filter(([companyId, e]) => e.fares > 0 && !locked.has(companyId))
+    .filter(
+      ([companyId, e]) =>
+        (e.cash.fares > 0 || e.card.fares > 0 || returnedBy.has(companyId)) &&
+        !locked.has(companyId),
+    )
     .map(([companyId, e]) => {
-      const fee = round2(e.feeTotal);
-      const tax = taxFor(companyId, fee);
+      const fee = round2(e.cash.fee);
+      const cashTax = round2(e.cash.tax);
+      const cardTax = round2(e.card.tax);
+      const ret = returnedBy.get(companyId);
+      const taxed = cashTax > 0 || cardTax > 0 || (ret?.tax ?? 0) > 0;
+      const t = taxed ? taxByCompany.get(companyId) : undefined;
       return {
         project_slug: spoke.slug,
         company_id: companyId,
         company_name: e.name,
         period_month: first,
-        cash_fares_total: round2(e.fares),
+        cash_fares_total: round2(e.cash.fares),
         fee_percent: e.feePct,
         // Sourced from the RPC's own per-ride fee_total (frozen per-ride rate),
         // never re-derived from fares*feePct — a mid-period rate change means
         // feePct is only a blended display value, not something the dollar
         // amount can be recomputed from.
-        // Stays the FEE alone — the revenue rollup sums this column as revenue.
-        // The payable figure is total_due.
+        // Stays the cash FEE alone — the revenue rollup sums this column as
+        // revenue. The payable figure is total_due.
         amount_due: fee,
-        tax_label: tax?.label ?? null,
-        tax_rate_percent: tax?.ratePercent ?? null,
-        tax_amount: tax?.amount ?? null,
-        total_due: round2(fee + (tax?.amount ?? 0)),
-        ride_count: e.rides,
+        // The label/rate print beside whichever section carries tax. The
+        // company's current rate if it is readable, else a bare "Tax" line:
+        // the AMOUNT is what was actually charged either way.
+        tax_label: taxed ? (t?.label ?? "Tax") : null,
+        tax_rate_percent: taxed ? (t?.ratePercent ?? null) : null,
+        tax_amount: cashTax > 0 ? cashTax : null,
+        total_due: round2(fee + cashTax),
+        ride_count: e.cash.rides,
+        card_fares_total: round2(e.card.fares),
+        card_fee_total: round2(e.card.fee),
+        card_tax_amount: cardTax > 0 ? cardTax : null,
+        card_ride_count: e.card.rides,
+        card_fee_returned: ret ? round2(ret.fee) : null,
+        card_tax_returned: ret && ret.tax > 0 ? round2(ret.tax) : null,
+        card_fee_return_count: ret ? ret.count : null,
         status: "draft",
         generated_by: owner.id,
         generated_at: new Date().toISOString(),
@@ -712,7 +881,7 @@ type BuiltInvoicePdf = {
   rideCount: number;
   /** The fee alone. `totalDue` is what the company owes. */
   amountDue: number;
-  tax: { label: string; ratePercent: number; amount: number } | null;
+  tax: InvoiceTaxLine | null;
   totalDue: number;
   paymentInstructions: string | null;
   mailingAddress: string | null;
@@ -732,7 +901,7 @@ async function buildAndStoreInvoicePdf(
   const { data: invoice, error: invErr } = await supabaseAdmin
     .from("invoices")
     .select(
-      "id, company_id, company_name, period_month, cash_fares_total, fee_percent, ride_count, amount_due, invoice_number, tax_label, tax_rate_percent, tax_amount, total_due",
+      "id, company_id, company_name, period_month, cash_fares_total, fee_percent, ride_count, amount_due, invoice_number, tax_label, tax_rate_percent, tax_amount, total_due, card_fares_total, card_fee_total, card_tax_amount, card_ride_count, card_fee_returned, card_tax_returned, card_fee_return_count",
     )
     .eq("id", invoiceId)
     .maybeSingle();
@@ -767,13 +936,45 @@ async function buildAndStoreInvoicePdf(
   // no tax line was charged — which is every invoice generated before
   // 0008_invoice_tax.sql, and every one generated while Vellon is unregistered.
   // NULL total_due therefore reads as amount_due, never as 0.
-  const taxRate = invoice.tax_rate_percent == null ? null : Number(invoice.tax_rate_percent);
-  const tax =
-    taxRate != null && taxRate > 0 && invoice.tax_amount != null
+  //
+  // The label and rate describe the tax; each section has its own amount
+  // (cash payable, card already collected). The rate can be NULL beside a real
+  // amount (company rate unreadable at generation) — the line then prints
+  // without a percentage.
+  const taxMeta =
+    invoice.tax_label != null
       ? {
-          label: invoice.tax_label || "HST",
-          ratePercent: taxRate,
-          amount: Number(invoice.tax_amount),
+          label: invoice.tax_label,
+          ratePercent:
+            invoice.tax_rate_percent == null ? null : Number(invoice.tax_rate_percent),
+        }
+      : null;
+  const cashTaxAmount = invoice.tax_amount != null ? Number(invoice.tax_amount) : 0;
+  const tax =
+    taxMeta && cashTaxAmount > 0 ? { ...taxMeta, amount: cashTaxAmount } : null;
+  const cardRides = invoice.card_ride_count ?? 0;
+  const returnCount = invoice.card_fee_return_count ?? 0;
+  const card =
+    cardRides > 0 || returnCount > 0
+      ? {
+          faresTotal: Number(invoice.card_fares_total ?? 0),
+          rideCount: cardRides,
+          fee: Number(invoice.card_fee_total ?? 0),
+          tax:
+            taxMeta && invoice.card_tax_amount != null && Number(invoice.card_tax_amount) > 0
+              ? { ...taxMeta, amount: Number(invoice.card_tax_amount) }
+              : null,
+          returned:
+            returnCount > 0
+              ? {
+                  rideCount: returnCount,
+                  fee: Number(invoice.card_fee_returned ?? 0),
+                  tax:
+                    taxMeta && invoice.card_tax_returned != null && Number(invoice.card_tax_returned) > 0
+                      ? { ...taxMeta, amount: Number(invoice.card_tax_returned) }
+                      : null,
+                }
+              : null,
         }
       : null;
   const totalDue =
@@ -790,6 +991,7 @@ async function buildAndStoreInvoicePdf(
     rideCount: invoice.ride_count,
     amountDue: Number(invoice.amount_due),
     tax,
+    card,
     totalDue,
     vellon: settingsRes.data,
   });
@@ -1426,7 +1628,19 @@ export type RefundableRide = {
   settlementRoute: string | null;
   refundable: boolean; // passes every guard below
   blockedReason: string | null; // why not, if refundable === false
+  // Direct charges only: Vellon's application fee (fee + tax) on the ride, and
+  // whether it has been handed back. feeCents is null on any other ride.
+  feeCents: number | null;
+  feeTaxCents: number;
+  feeReturnedAt: string | null;
 };
+
+// A direct charge lives on the company's own Stripe account. A /refunds call
+// from here goes to Vellon's platform, where that PaymentIntent does not exist;
+// and the refund is the company's to give, out of its own balance. What Vellon
+// can give back on such a ride is its own fee — returnVellonFee below.
+const DIRECT_CHARGE_REFUND_BLOCK =
+  "Charged on the company's own Stripe account — the company refunds it, not Vellon.";
 
 // Find a passenger's completed card rides by phone, newest first, annotated with
 // whether each can still be refunded. Phone match is a loose suffix contains —
@@ -1464,7 +1678,7 @@ export async function searchRefundableRides(
     const { data: rides, error: rErr } = await mgcj
       .from("rides")
       .select(
-        "id, company_id, driver_id, passenger_id, completed_at, fare_final, payment_method, payment_status, stripe_payment_intent_id, stripe_dispute_id, refunded_amount_cents, settlement_route",
+        "id, company_id, driver_id, passenger_id, completed_at, fare_final, payment_method, payment_status, stripe_payment_intent_id, stripe_dispute_id, refunded_amount_cents, settlement_route, stripe_charge_account_id, application_fee_cents, application_fee_tax_cents, application_fee_returned_at",
       )
       .in("passenger_id", [...passengerById.keys()])
       .eq("payment_method", "card")
@@ -1494,7 +1708,8 @@ export async function searchRefundableRides(
       const refundedCents = r.refunded_amount_cents ?? 0;
 
       let blockedReason: string | null = null;
-      if (r.stripe_dispute_id) blockedReason = "Charge is disputed — resolve the dispute, don't refund.";
+      if (r.stripe_charge_account_id) blockedReason = DIRECT_CHARGE_REFUND_BLOCK;
+      else if (r.stripe_dispute_id) blockedReason = "Charge is disputed — resolve the dispute, don't refund.";
       else if (!r.stripe_payment_intent_id) blockedReason = "No payment intent on this ride.";
       else if (r.payment_status !== "succeeded") {
         blockedReason =
@@ -1514,9 +1729,15 @@ export async function searchRefundableRides(
         fareFinal: r.fare_final,
         chargedCents,
         refundedCents,
-        settlementRoute: r.settlement_route,
+        settlementRoute: r.settlement_route ?? (r.stripe_charge_account_id ? "direct" : null),
         refundable: blockedReason === null,
         blockedReason,
+        feeCents:
+          r.stripe_charge_account_id && r.application_fee_cents > 0
+            ? r.application_fee_cents
+            : null,
+        feeTaxCents: r.application_fee_tax_cents ?? 0,
+        feeReturnedAt: r.application_fee_returned_at ?? null,
       };
     });
 
@@ -1545,12 +1766,16 @@ export async function refundRide(
     }
     const absorbedBy = REFUND_ABSORBED_BY[input.reason];
     if (!absorbedBy) return { ok: false, error: "Unknown refund reason." };
+    // The transfer clawback was retired with the transfers (mgcj-app design
+    // note §16): nothing would take a driver-fault refund back from anyone.
+    if (absorbedBy !== "vellon")
+      return { ok: false, error: "Driver-fault refunds are no longer available — Vellon absorbs every refund it issues." };
 
     const mgcj = spokeSupabase(spoke);
     const { data: ride, error: rErr } = await mgcj
       .from("rides")
       .select(
-        "id, company_id, payment_method, payment_status, stripe_payment_intent_id, stripe_dispute_id, fare_final, refunded_amount_cents",
+        "id, company_id, payment_method, payment_status, stripe_payment_intent_id, stripe_dispute_id, fare_final, refunded_amount_cents, stripe_charge_account_id",
       )
       .eq("id", input.rideId)
       .maybeSingle();
@@ -1559,6 +1784,7 @@ export async function refundRide(
 
     // Guards — mirror searchRefundableRides so a stale UI can't push a bad refund.
     if (ride.payment_method !== "card") return { ok: false, error: "Not a card ride." };
+    if (ride.stripe_charge_account_id) return { ok: false, error: DIRECT_CHARGE_REFUND_BLOCK };
     if (ride.stripe_dispute_id)
       return { ok: false, error: "Charge is disputed — resolve the dispute instead of refunding." };
     if (!ride.stripe_payment_intent_id)
@@ -1633,8 +1859,132 @@ export async function refundRide(
       ok: true,
       refundId: refund.id,
       amountCents: amount,
-      clawback: absorbedBy === "driver_company",
+      clawback: false,
     };
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
+  }
+}
+
+// ── Return Vellon's fee ─────────────────────────────────────────────
+// On a direct charge the fare is the company's and so is refunding it. The one
+// thing Vellon holds from the ride is its application fee, and this hands it
+// back: an application-fee refund, Vellon's balance -> the company's. The
+// passenger is not involved.
+//
+// WHOLE FEE ONLY, tax included — there is no amount to type and no fee/tax
+// split to round. The fee object lives on the PLATFORM; finding it means
+// reading the charge on the company's account first.
+//
+// Safe to press twice: the fee is read back before anything is sent, so a
+// return that reached Stripe but not the ride row is recorded, not repeated.
+type StripeAppFee = {
+  id?: string;
+  amount?: number;
+  amount_refunded?: number;
+  refunds?: { data?: { id: string }[] };
+  error?: { message?: string };
+};
+
+export async function returnVellonFee(
+  slug: string,
+  input: { rideId: string },
+): Promise<
+  | { ok: true; returnedCents: number; taxCents: number }
+  | { ok: false; error: string }
+> {
+  const owner = await requirePlatformOwner();
+  const spoke = await loadSpoke(slug);
+  try {
+    if (!spokeStripeConfigured(spoke)) {
+      return { ok: false, error: "Stripe is not configured (MGCJ_STRIPE_SECRET)." };
+    }
+    const mgcj = spokeSupabase(spoke);
+    const { data: ride, error: rErr } = await mgcj
+      .from("rides")
+      .select(
+        "id, company_id, payment_method, stripe_payment_intent_id, stripe_charge_account_id, application_fee_cents, application_fee_tax_cents, application_fee_returned_at",
+      )
+      .eq("id", input.rideId)
+      .maybeSingle();
+    if (rErr) throw new Error(rErr.message);
+    if (!ride) return { ok: false, error: "Ride not found." };
+    if (ride.payment_method !== "card" || !ride.stripe_charge_account_id)
+      return { ok: false, error: "Not a card fare charged on a company's Stripe account." };
+    if (!ride.stripe_payment_intent_id)
+      return { ok: false, error: "No payment intent on this ride." };
+    if (!(ride.application_fee_cents > 0))
+      return { ok: false, error: "Vellon took no fee on this ride." };
+    if (ride.application_fee_returned_at)
+      return { ok: false, error: "The fee on this ride was already returned." };
+
+    const pi = await spokeStripeGet(
+      spoke,
+      `/payment_intents/${ride.stripe_payment_intent_id}?expand[]=latest_charge`,
+      ride.stripe_charge_account_id,
+    );
+    if (pi.error) return { ok: false, error: pi.error.message ?? "Stripe could not read the charge." };
+    const feeRef = pi.latest_charge?.application_fee;
+    const feeId: string | null = typeof feeRef === "string" ? feeRef : feeRef?.id ?? null;
+    if (!feeId) return { ok: false, error: "Stripe shows no application fee on this charge." };
+
+    let fee: StripeAppFee = await spokeStripeGet(spoke, `/application_fees/${feeId}`);
+    if (fee.error) return { ok: false, error: fee.error.message ?? "Stripe could not read the fee." };
+    const amount = fee.amount ?? 0;
+    const already = fee.amount_refunded ?? 0;
+    // The ride row sizes the tax figures and the document; a fee at Stripe that
+    // is not the one recorded would make both wrong.
+    if (amount !== ride.application_fee_cents) {
+      return {
+        ok: false,
+        error: `Stripe's fee on this charge is ${amount} cents but the ride records ${ride.application_fee_cents}. Not returned — look at the ride first.`,
+      };
+    }
+
+    let refundId: string | null = fee.refunds?.data?.[0]?.id ?? null;
+    if (already < amount) {
+      const refund = await spokeStripePost(
+        spoke,
+        `/application_fees/${feeId}/refunds`,
+        { amount: String(amount - already), "metadata[ride_id]": ride.id },
+        `fee-return-${ride.id}-${already}`,
+      );
+      if (refund.error) {
+        return { ok: false, error: refund.error.message ?? "Stripe refused to return the fee." };
+      }
+      refundId = refund.id ?? refundId;
+      fee = await spokeStripeGet(spoke, `/application_fees/${feeId}`);
+      if ((fee.amount_refunded ?? 0) < amount) {
+        return { ok: false, error: "Stripe accepted the return but the fee does not read as fully returned yet. Try again in a moment." };
+      }
+    }
+
+    const taxCents = ride.application_fee_tax_cents ?? 0;
+    const { error: uErr } = await mgcj
+      .from("rides")
+      .update({
+        application_fee_returned_cents: amount,
+        application_fee_tax_returned_cents: taxCents > 0 ? taxCents : null,
+        application_fee_returned_at: new Date().toISOString(),
+        application_fee_refund_id: refundId,
+      })
+      .eq("id", ride.id);
+    if (uErr) {
+      return {
+        ok: false,
+        error: `The fee was returned at Stripe but the ride was not updated (${uErr.message}). Press Return fee again to record it — nothing will be sent twice.`,
+      };
+    }
+
+    await writeAudit({
+      actorUserId: owner.id,
+      projectSlug: spoke.slug,
+      action: "ride.fee_return",
+      target: ride.id,
+      after: { returnedCents: amount, taxCents, feeId, refundId },
+    });
+
+    return { ok: true, returnedCents: amount, taxCents };
   } catch (e) {
     return { ok: false, error: (e as Error).message };
   }
@@ -1733,6 +2083,10 @@ export async function getRefundsByReason(
       )
       .not("refunded_at", "is", null)
       .gt("refunded_amount_cents", 0)
+      // Platform charges only. A refund on a direct charge is issued by the
+      // company out of its own Stripe balance and Vellon keeps its fee, so it
+      // is not a Vellon cost in any bucket here.
+      .is("stripe_charge_account_id", null)
       .gte("refunded_at", input.fromISO)
       .lt("refunded_at", input.toISO)
       .order("refunded_at", { ascending: false });
