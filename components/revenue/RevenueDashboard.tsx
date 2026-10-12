@@ -15,6 +15,7 @@ import {
   getRefundsByReason,
   searchRefundableRides,
   refundRide,
+  returnVellonFee,
   type RevenueSummary,
   type Invoice,
   type DisputeCosts,
@@ -164,7 +165,13 @@ export function RevenueDashboard({ slug }: { slug: string }) {
               label="Card fees"
               value={cad(rev.totals.cardFee)}
               dot={CARD}
-              sub={rev.totals.refunds > 0 ? "auto-collected, net of refunds" : "auto-collected"}
+              sub={
+                rev.totals.feeReturned > 0
+                  ? `auto-collected, net of ${cad(rev.totals.feeReturned)} returned to companies`
+                  : rev.totals.refunds > 0
+                    ? "auto-collected, net of refunds"
+                    : "auto-collected"
+              }
             />
             <Tile
               label="Cash fees"
@@ -1481,6 +1488,9 @@ function RefundSection({ slug }: { slug: string }) {
   const [error, setError] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
   const [active, setActive] = useState<RefundableRide | null>(null); // ride being refunded
+  // Returning a fee moves money, so it takes two presses: the first arms the
+  // row, the second sends it.
+  const [armedFee, setArmedFee] = useState<string | null>(null);
   const [pending, startTransition] = useTransition();
 
   const search = useCallback(() => {
@@ -1493,13 +1503,33 @@ function RefundSection({ slug }: { slug: string }) {
     });
   }, [phone]);
 
+  const returnFee = (r: RefundableRide) => {
+    setError(null);
+    setNote(null);
+    startTransition(async () => {
+      const res = await returnVellonFee(slug, { rideId: r.id });
+      setArmedFee(null);
+      if (!res.ok) {
+        setError(res.error);
+        return;
+      }
+      setNote(
+        `Returned ${cad(res.returnedCents / 100)} to ${r.companyName}` +
+          (res.taxCents > 0 ? ` (includes ${cad(res.taxCents / 100)} tax).` : "."),
+      );
+      const again = await searchRefundableRides(slug, { phone });
+      if (again.ok) setRides(again.data);
+    });
+  };
+
   return (
     <section>
       <h2 className="text-sm font-semibold text-zinc-300">Refunds</h2>
       <p className="mt-1 text-xs text-zinc-500">
         Look up a passenger&apos;s completed card rides by phone and issue a
         refund. Cash rides aren&apos;t refundable here — they&apos;re invoiced
-        monthly.
+        monthly. A fare charged on the company&apos;s own Stripe account is the
+        company&apos;s to refund; what Vellon can give back on it is its own fee.
       </p>
 
       <div className="mt-3 flex flex-wrap items-center gap-2">
@@ -1569,6 +1599,41 @@ function RefundSection({ slug }: { slug: string }) {
                       >
                         Refund
                       </button>
+                    ) : r.feeCents != null ? (
+                      r.feeReturnedAt ? (
+                        <span className="text-xs text-zinc-500">
+                          Fee returned {fmtDate(r.feeReturnedAt)} ({cad(r.feeCents / 100)})
+                        </span>
+                      ) : armedFee === r.id ? (
+                        <span className="inline-flex items-center gap-2">
+                          <button
+                            onClick={() => returnFee(r)}
+                            disabled={pending}
+                            className="rounded-md border border-amber-700 bg-amber-950/40 px-2.5 py-1 text-xs text-amber-200 hover:bg-amber-950/70 disabled:opacity-50"
+                          >
+                            {pending ? "…" : `Confirm: return ${cad(r.feeCents / 100)}`}
+                          </button>
+                          <button
+                            onClick={() => setArmedFee(null)}
+                            disabled={pending}
+                            className="text-xs text-zinc-500 hover:text-zinc-300"
+                          >
+                            Cancel
+                          </button>
+                        </span>
+                      ) : (
+                        <button
+                          onClick={() => setArmedFee(r.id)}
+                          title={
+                            r.feeTaxCents > 0
+                              ? `Vellon's fee ${cad((r.feeCents - r.feeTaxCents) / 100)} + ${cad(r.feeTaxCents / 100)} tax, back to the company. The passenger's fare is not touched.`
+                              : "Vellon's fee, back to the company. The passenger's fare is not touched."
+                          }
+                          className="rounded-md border border-amber-800/60 px-2.5 py-1 text-xs text-amber-300 hover:bg-amber-950/40"
+                        >
+                          Return Vellon&apos;s fee
+                        </button>
+                      )
                     ) : (
                       <span className="text-xs text-zinc-600" title={r.blockedReason ?? ""}>
                         {r.blockedReason ?? "—"}

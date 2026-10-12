@@ -47,6 +47,16 @@ export type InvoicePdfInput = {
     rideCount: number;
     fee: number;
     tax: InvoiceTaxLine | null;
+    /**
+     * Fees Vellon returned to the company DURING this period, whichever month
+     * the ride was in. The tax line here is the credit the company adjusts its
+     * input tax credit by. NULL = none returned.
+     */
+    returned: {
+      rideCount: number;
+      fee: number;
+      tax: InvoiceTaxLine | null;
+    } | null;
   } | null;
   /** amountDue + tax (cash only). Equals amountDue when `tax` is null. */
   totalDue: number;
@@ -110,7 +120,7 @@ export async function buildInvoicePdf(input: InvoicePdfInput): Promise<Uint8Arra
   // gate, so the two halves of that claim cannot disagree. (BN is not a tax
   // claim and prints whenever it is configured.)
   // "Either section": a month of card rides only still charged tax.
-  const anyTax = input.tax ?? input.card?.tax ?? null;
+  const anyTax = input.tax ?? input.card?.tax ?? input.card?.returned?.tax ?? null;
   const regNumbers = [
     input.vellon.businessNumber ? `BN: ${input.vellon.businessNumber}` : null,
     anyTax && input.vellon.hstNumber
@@ -177,7 +187,7 @@ export async function buildInvoicePdf(input: InvoicePdfInput): Promise<Uint8Arra
   }
 
   // ── Card fares: fee already collected ─────────────────────────────────
-  if (input.card) {
+  if (input.card && input.card.rideCount > 0) {
     y -= 26;
     draw("CARD FARES — FEE ALREADY COLLECTED", left + 6, y, { size: 9, color: gray });
     y -= 18;
@@ -192,6 +202,24 @@ export async function buildInvoicePdf(input: InvoicePdfInput): Promise<Uint8Arra
     row(
       "Collected through Stripe when each fare was charged",
       `-${money(input.card.fee + (input.card.tax?.amount ?? 0))}`,
+    );
+  }
+
+  // ── Fees returned: a credit, already paid back ────────────────────────
+  const returned = input.card?.returned;
+  if (returned) {
+    y -= 26;
+    draw("CARD FARES — FEE RETURNED TO YOU (CREDIT)", left + 6, y, { size: 9, color: gray });
+    y -= 18;
+    row(`Platform fee returned this period (${plural(returned.rideCount)})`, `-${money(returned.fee)}`, true);
+    if (returned.tax) {
+      y -= 18;
+      row(`${taxText(returned.tax)} returned`, `-${money(returned.tax.amount)}`);
+    }
+    y -= 18;
+    row(
+      "Paid back to your Stripe balance when each fee was returned",
+      money(returned.fee + (returned.tax?.amount ?? 0)),
     );
   }
 

@@ -152,10 +152,12 @@ export async function spokeStripePost(
   return res.json();
 }
 
-export async function spokeStripeGet(spoke: Spoke, path: string) {
-  const res = await fetch(`https://api.stripe.com/v1${path}`, {
-    headers: { Authorization: `Bearer ${stripeKey(spoke)}` },
-  });
+// `stripeAccount` reads an object that lives on a connected account (a direct
+// charge's PaymentIntent is the company's, not the platform's).
+export async function spokeStripeGet(spoke: Spoke, path: string, stripeAccount?: string) {
+  const headers: Record<string, string> = { Authorization: `Bearer ${stripeKey(spoke)}` };
+  if (stripeAccount) headers["Stripe-Account"] = stripeAccount;
+  const res = await fetch(`https://api.stripe.com/v1${path}`, { headers });
   return res.json();
 }
 

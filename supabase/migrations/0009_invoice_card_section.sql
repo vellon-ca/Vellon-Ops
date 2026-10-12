@@ -32,3 +32,17 @@ comment on column public.invoices.card_fee_total is
 comment on column public.invoices.card_tax_amount is
   'GST/HST on card_fee_total, already collected. Summed from what Stripe took '
   'per ride (rides.application_fee_tax_cents).';
+
+-- Fees Vellon RETURNED to the company during the period (mgcj
+-- 20261013010000), by date of return, whichever month the ride was in. The
+-- columns above stay as collected; these are the credit against them, printed
+-- as their own block so the company can adjust its input tax credit. NULL =
+-- nothing returned.
+alter table public.invoices
+  add column if not exists card_fee_returned     numeric(12,2),
+  add column if not exists card_tax_returned     numeric(12,2),
+  add column if not exists card_fee_return_count integer;
+
+comment on column public.invoices.card_fee_returned is
+  'Vellon''s fee (without tax) returned to the company this period. A credit, '
+  'already paid back through Stripe; NOT part of amount_due or total_due.';
