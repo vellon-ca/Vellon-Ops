@@ -137,7 +137,14 @@ async function fetchRevRows(
 // that went back with it. Read by both the revenue rollup and the invoice
 // generator so the screen and the document cannot bucket a return differently.
 // A spoke that predates the migration has no such column and no returns.
-type FeeReturn = { companyId: string; month: string; fee: number; tax: number; count: number };
+type FeeReturn = {
+  companyId: string;
+  companyName: string;
+  month: string;
+  fee: number;
+  tax: number;
+  count: number;
+};
 
 async function fetchFeeReturns(
   spoke: Spoke,
@@ -147,7 +154,7 @@ async function fetchFeeReturns(
   const { data, error } = await spokeSupabase(spoke)
     .from("rides")
     .select(
-      "company_id, application_fee_returned_at, application_fee_returned_cents, application_fee_tax_returned_cents",
+      "company_id, application_fee_returned_at, application_fee_returned_cents, application_fee_tax_returned_cents, companies(name)",
     )
     .gte("application_fee_returned_at", fromISO)
     .lt("application_fee_returned_at", toISO);
@@ -159,7 +166,11 @@ async function fetchFeeReturns(
   for (const r of data ?? []) {
     const month = `${String(r.application_fee_returned_at).slice(0, 7)}-01`;
     const key = `${r.company_id}|${month}`;
-    const e = out.get(key) ?? { companyId: r.company_id, month, fee: 0, tax: 0, count: 0 };
+    // supabase-js types a to-one embed as an array; at runtime it is one object.
+    const co = r.companies as unknown as { name: string } | { name: string }[] | null;
+    const companyName = (Array.isArray(co) ? co[0]?.name : co?.name) ?? "Unknown company";
+    const e =
+      out.get(key) ?? { companyId: r.company_id, companyName, month, fee: 0, tax: 0, count: 0 };
     const total = Number(r.application_fee_returned_cents ?? 0);
     const tax = Number(r.application_fee_tax_returned_cents ?? 0);
     e.fee += (total - tax) / 100;
@@ -273,11 +284,22 @@ export async function getRevenue(
       totals.feeReturned += f.fee;
       totals.feeTax -= f.tax;
       totals.cardFeeTax -= f.tax;
-      const c = companies.get(f.companyId);
-      if (c) {
-        c.totalFee -= f.fee;
-        c.cardFee -= f.fee;
-      }
+      // A company with a return and no rides in the range still gets a row, or
+      // the table would stop adding up to the tiles.
+      const c =
+        companies.get(f.companyId) ??
+        {
+          companyId: f.companyId,
+          companyName: f.companyName,
+          cardFee: 0,
+          cashFee: 0,
+          totalFee: 0,
+          rides: 0,
+          fares: 0,
+        };
+      c.totalFee -= f.fee;
+      c.cardFee -= f.fee;
+      companies.set(f.companyId, c);
       const mo =
         months.get(f.month) ??
         { month: f.month, cardFee: 0, cashFee: 0, totalFee: 0 };
@@ -677,7 +699,7 @@ export async function generateInvoices(
     if (cErr) return { ok: false, error: cErr.message };
     for (const c of cs ?? []) {
       perCompany.set(c.id, {
-        name: c.name,
+        name: c.name ?? returnedBy.get(c.id)?.companyName ?? "Unknown company",
         feePct: Number(c.platform_fee_percent ?? 0),
         cash: { fares: 0, fee: 0, tax: 0, rides: 0 },
         card: { fares: 0, fee: 0, tax: 0, rides: 0 },

@@ -183,8 +183,10 @@ export function RevenueDashboard({ slug }: { slug: string }) {
           </div>
 
           {/* Tax on the fee is a liability, so it sits apart from the fee tiles
-              and is in none of them. Hidden while the fee is untaxed. */}
-          {rev.totals.feeTax > 0 && (
+              and is in none of them. Hidden while the fee is untaxed. Shown when
+              negative too: returns can outweigh a range's tax, and that is a
+              credit owed back, not nothing. */}
+          {rev.totals.feeTax !== 0 && (
             <div className={card}>
               <div className="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-1">
                 <p className="text-sm text-zinc-400">GST/HST charged on fees</p>
@@ -192,7 +194,8 @@ export function RevenueDashboard({ slug }: { slug: string }) {
               </div>
               <p className="mt-1 text-xs text-zinc-500">
                 {cad(rev.totals.cardFeeTax)} collected with card fees, {cad(rev.totals.cashFeeTax)} billed
-                on cash invoices. Owed to the CRA and not included in the fee figures above.
+                on cash invoices, net of tax on fees returned. Owed to the CRA and not included in the
+                fee figures above.
               </p>
             </div>
           )}
