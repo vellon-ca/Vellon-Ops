@@ -175,6 +175,21 @@ export function RevenueDashboard({ slug }: { slug: string }) {
             <Tile label="Completed rides" value={rev.totals.rides.toLocaleString()} />
           </div>
 
+          {/* Tax on the fee is a liability, so it sits apart from the fee tiles
+              and is in none of them. Hidden while the fee is untaxed. */}
+          {rev.totals.feeTax > 0 && (
+            <div className={card}>
+              <div className="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-1">
+                <p className="text-sm text-zinc-400">GST/HST charged on fees</p>
+                <p className="text-lg font-semibold text-zinc-100">{cad(rev.totals.feeTax)}</p>
+              </div>
+              <p className="mt-1 text-xs text-zinc-500">
+                {cad(rev.totals.cardFeeTax)} collected with card fees, {cad(rev.totals.cashFeeTax)} billed
+                on cash invoices. Owed to the CRA and not included in the fee figures above.
+              </p>
+            </div>
+          )}
+
           <FeeTrend data={rev.byMonth} />
 
           {/* By company */}

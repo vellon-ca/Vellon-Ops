@@ -82,6 +82,12 @@ export type RevenueSummary = {
     cashFee: number;
     refunds: number; // realized refund loss, netted out of fee/cardFee above
     rides: number;
+    // GST/HST charged on the fee. Owed to the CRA, never revenue, so it is in
+    // none of the fee figures above. Card tax is already in hand (it rode in on
+    // the application fee); cash tax is billed on the monthly document.
+    feeTax: number;
+    cardFeeTax: number;
+    cashFeeTax: number;
   };
   byCompany: {
     companyId: string;
@@ -164,7 +170,10 @@ export async function getRevenue(
   try {
     const rows = await fetchRevRows(spoke, input.fromISO, input.toISO);
 
-    const totals = { fares: 0, fee: 0, cardFee: 0, cashFee: 0, refunds: 0, rides: 0 };
+    const totals = {
+      fares: 0, fee: 0, cardFee: 0, cashFee: 0, refunds: 0, rides: 0,
+      feeTax: 0, cardFeeTax: 0, cashFeeTax: 0,
+    };
     const companies = new Map<string, RevenueSummary["byCompany"][number]>();
     const months = new Map<string, RevenueSummary["byMonth"][number]>();
 
@@ -178,8 +187,14 @@ export async function getRevenue(
       totals.fee += netFee;
       totals.refunds += r.refund_total;
       totals.rides += r.ride_count;
-      if (isCard) totals.cardFee += netFee;
-      else totals.cashFee += netFee;
+      totals.feeTax += r.fee_tax_total;
+      if (isCard) {
+        totals.cardFee += netFee;
+        totals.cardFeeTax += r.fee_tax_total;
+      } else {
+        totals.cashFee += netFee;
+        totals.cashFeeTax += r.fee_tax_total;
+      }
 
       const c =
         companies.get(r.company_id) ??
@@ -221,6 +236,9 @@ export async function getRevenue(
           cashFee: fix(totals.cashFee),
           refunds: fix(totals.refunds),
           rides: totals.rides,
+          feeTax: fix(totals.feeTax),
+          cardFeeTax: fix(totals.cardFeeTax),
+          cashFeeTax: fix(totals.cashFeeTax),
         },
         byCompany: [...companies.values()]
           .map((c) => ({
