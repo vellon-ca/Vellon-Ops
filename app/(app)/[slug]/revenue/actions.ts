@@ -1747,6 +1747,10 @@ export async function getRefundsByReason(
       )
       .not("refunded_at", "is", null)
       .gt("refunded_amount_cents", 0)
+      // Platform charges only. A refund on a direct charge is issued by the
+      // company out of its own Stripe balance and Vellon keeps its fee, so it
+      // is not a Vellon cost in any bucket here.
+      .is("stripe_charge_account_id", null)
       .gte("refunded_at", input.fromISO)
       .lt("refunded_at", input.toISO)
       .order("refunded_at", { ascending: false });
