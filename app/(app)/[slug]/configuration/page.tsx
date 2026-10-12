@@ -1,5 +1,4 @@
 import { ConfigurationForm } from "@/components/configuration/ConfigurationForm";
-import { PayoutTimingForm } from "@/components/configuration/PayoutTimingForm";
 
 export default async function ConfigurationPage({
   params,
@@ -10,7 +9,6 @@ export default async function ConfigurationPage({
   return (
     <div>
       <ConfigurationForm slug={slug} />
-      <PayoutTimingForm slug={slug} />
     </div>
   );
 }

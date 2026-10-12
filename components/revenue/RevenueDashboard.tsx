@@ -1431,19 +1431,14 @@ function RefundsByReasonSection({
 
 // ── Refunds ─────────────────────────────────────────────────────────
 // Look up a passenger's completed card rides and issue a refund after
-// investigating a complaint. The reason chosen in the modal decides who
-// absorbs it (driver/company vs Vellon); the driver clawback, if any, runs a
-// moment later via mgcj's stripe-webhook. See refundRide in actions.ts.
+// investigating a complaint. Only for the few rides charged on Vellon's own
+// account before direct charges; Vellon absorbs every refund it issues here.
+// A direct charge is refunded by the company from its dashboard.
 const REASON_OPTIONS: {
   value: RefundReason;
   label: string;
   blurb: string;
 }[] = [
-  {
-    value: "driver_fault",
-    label: "Driver / company at fault",
-    blurb: "Clawed back from the driver's payout, driver-first. Vellon keeps its fee.",
-  },
   {
     value: "platform_mistake",
     label: "Platform mistake",
@@ -1632,10 +1627,7 @@ function RefundModal({
         return;
       }
       onDone(
-        `Refunded ${cad(res.amountCents / 100)}` +
-          (res.clawback
-            ? " — the driver/company clawback will complete via Stripe shortly."
-            : " — absorbed by Vellon."),
+        `Refunded ${cad(res.amountCents / 100)} — absorbed by Vellon.`,
       );
     });
   };

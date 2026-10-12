@@ -8,12 +8,9 @@ import {
   createAdmin,
   createDispatchers,
   addInvites,
-  startStripeOnboarding,
-  refreshStripeStatus,
   getCompanyForEdit,
   type InviteResult,
   type DispatcherResult,
-  type StripeStatus,
   type CompanyDetail,
 } from "@/app/(app)/[slug]/onboarding/actions";
 import { DirectAccountPanel } from "./DirectAccountPanel";
@@ -63,10 +60,6 @@ export function OnboardingWizard({ slug }: { slug: string }) {
   const [dispatchersCreated, setDispatchersCreated] = useState<DispatcherResult[]>([]);
   const [invites, setInvites] = useState<InviteResult[]>([]);
   const [driverRows, setDriverRows] = useState([{ name: "", phone: "" }]);
-  const [stripe, setStripe] = useState<StripeStatus | null>(null);
-  // Set on every successful status poll so a check that doesn't change the
-  // outcome still gives the user visible feedback that it ran.
-  const [stripeCheckedAt, setStripeCheckedAt] = useState<string | null>(null);
 
   // Same-name guard: hold the last attempted company so "Create anyway" can
   // re-submit it with force=true.
@@ -88,8 +81,6 @@ export function OnboardingWizard({ slug }: { slug: string }) {
     setDispatchersCreated([]);
     setInvites([]);
     setDriverRows([{ name: "", phone: "" }]);
-    setStripe(null);
-    setStripeCheckedAt(null);
     setDupInput(null);
     setError(null);
   }
@@ -110,16 +101,6 @@ export function OnboardingWizard({ slug }: { slug: string }) {
       setCompanyId(resume.id);
       setCompanyName(resume.name);
       setStep(resumeStep(resume));
-      // Pull live Stripe state (and a fresh link) if an account already exists.
-      if (resume.stripeAccountId) {
-        startTransition(async () => {
-          const stripeRes = await refreshStripeStatus(slug, { companyId: resume.id });
-          if (stripeRes.ok) {
-            setStripe(stripeRes.data);
-            setStripeCheckedAt(new Date().toLocaleTimeString());
-          }
-        });
-      }
     });
   }, [resumeId]);
 
@@ -540,86 +521,6 @@ export function OnboardingWizard({ slug }: { slug: string }) {
 
         {step === 4 && (
           <div className="space-y-4">
-            <p className="text-sm text-zinc-500">
-              Set up Stripe payouts for {companyName}. This creates a Connect
-              account and gives you an onboarding link to send them. The company
-              only goes payment-ready once Stripe confirms it.
-            </p>
-
-            {!stripe && (
-              <button
-                type="button"
-                disabled={pending}
-                onClick={() =>
-                  run(async () => {
-                    const res = await startStripeOnboarding(slug, {
-                      companyId: companyId!,
-                    });
-                    if (!res.ok) return setError(res.error);
-                    setStripe(res.data);
-                  })
-                }
-                className="w-full rounded-md bg-accent px-3 py-2 text-sm font-medium text-white hover:bg-accent-hover disabled:opacity-50"
-              >
-                {pending ? "Creating…" : "Create Stripe account"}
-              </button>
-            )}
-
-            {stripe && (
-              <div className="space-y-3">
-                {stripe.chargesEnabled ? (
-                  <div className="rounded-md border border-emerald-900/40 bg-emerald-950/30 px-3 py-2 text-sm text-emerald-300">
-                    ✅ Stripe onboarded — this company is payment-ready.
-                  </div>
-                ) : (
-                  <>
-                    <div className="space-y-1.5">
-                      <label className={label}>Onboarding link (send to company)</label>
-                      <input
-                        readOnly
-                        value={stripe.onboardingUrl ?? ""}
-                        onFocus={(e) => e.currentTarget.select()}
-                        className={input + " text-xs"}
-                      />
-                    </div>
-                    <button
-                      type="button"
-                      disabled={pending}
-                      onClick={() =>
-                        run(async () => {
-                          const res = await refreshStripeStatus(slug, {
-                            companyId: companyId!,
-                          });
-                          if (!res.ok) return setError(res.error);
-                          setStripe(res.data);
-                          setStripeCheckedAt(new Date().toLocaleTimeString());
-                        })
-                      }
-                      className="w-full rounded-md border border-zinc-700 px-3 py-2 text-sm text-zinc-300 hover:bg-zinc-800/50 disabled:opacity-50"
-                    >
-                      {pending ? "Checking…" : "Check status"}
-                    </button>
-                    {!stripe.onboardingUrl && (
-                      <p className="text-xs text-amber-300/80">
-                        Couldn&apos;t generate a fresh onboarding link — click
-                        Check status to try again.
-                      </p>
-                    )}
-                    {stripeCheckedAt && (
-                      <p className="text-xs text-zinc-500">
-                        {stripe.detailsSubmitted
-                          ? "Details submitted — Stripe is still reviewing. This can take a few minutes."
-                          : "Not completed yet — the company still needs to finish the Stripe form via the link above."}{" "}
-                        <span className="text-zinc-600">
-                          (checked {stripeCheckedAt})
-                        </span>
-                      </p>
-                    )}
-                  </>
-                )}
-              </div>
-            )}
-
             {companyId && (
               <DirectAccountPanel
                 slug={slug}
@@ -634,7 +535,7 @@ export function OnboardingWizard({ slug }: { slug: string }) {
                 onClick={() => setStep(5)}
                 className="w-full rounded-md border border-zinc-700 px-3 py-2 text-sm text-zinc-300 hover:bg-zinc-800/50"
               >
-                {stripe?.chargesEnabled ? "Finish" : "Skip / finish later"}
+                Finish
               </button>
             </div>
           </div>
@@ -671,16 +572,6 @@ export function OnboardingWizard({ slug }: { slug: string }) {
                     </div>
                   ))}
                 </div>
-              </div>
-            )}
-            {stripe?.chargesEnabled ? (
-              <div className="rounded-md border border-emerald-900/40 bg-emerald-950/30 px-3 py-2 text-xs text-emerald-300">
-                Stripe onboarded — card payouts route to this company.
-              </div>
-            ) : (
-              <div className="rounded-md border border-amber-900/40 bg-amber-950/30 px-3 py-2 text-xs text-amber-300/90">
-                Stripe not finished — card fares won&apos;t route to this company
-                until its Stripe onboarding is completed. You can revisit later.
               </div>
             )}
             <button

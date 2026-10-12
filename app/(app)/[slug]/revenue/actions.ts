@@ -1558,6 +1558,10 @@ export async function refundRide(
     }
     const absorbedBy = REFUND_ABSORBED_BY[input.reason];
     if (!absorbedBy) return { ok: false, error: "Unknown refund reason." };
+    // The transfer clawback was retired with the transfers (mgcj-app design
+    // note §16): nothing would take a driver-fault refund back from anyone.
+    if (absorbedBy !== "vellon")
+      return { ok: false, error: "Driver-fault refunds are no longer available — Vellon absorbs every refund it issues." };
 
     const mgcj = spokeSupabase(spoke);
     const { data: ride, error: rErr } = await mgcj
@@ -1647,7 +1651,7 @@ export async function refundRide(
       ok: true,
       refundId: refund.id,
       amountCents: amount,
-      clawback: absorbedBy === "driver_company",
+      clawback: false,
     };
   } catch (e) {
     return { ok: false, error: (e as Error).message };

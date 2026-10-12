@@ -1,12 +1,9 @@
 "use server";
 
-import { headers } from "next/headers";
 import { requirePlatformOwner } from "@/lib/auth/guard";
 import {
   loadSpoke,
   spokeSupabase,
-  spokeStripePost,
-  spokeStripeGet,
   spokeStripeConfigured,
   spokeStripeV2Get,
   spokeStripeV2Post,
@@ -103,7 +100,6 @@ export async function createCompany(
         ? (input.studentDiscountPct ?? 0)
         : 0,
       active: true,
-      stripe_onboarded: false,
     })
     .select("id")
     .single();
@@ -377,164 +373,8 @@ export async function addInvites(
   return { ok: true, data: { invites } };
 }
 
-// ── Step 4: Stripe Connect ──────────────────────────────────────────
-export type StripeStatus = {
-  accountId: string;
-  onboardingUrl: string | null;
-  chargesEnabled: boolean;
-  payoutsEnabled: boolean;
-  detailsSubmitted: boolean;
-};
-
-// Mint a fresh Stripe hosted-onboarding link. Account links are single-use and
-// expire quickly, so we always generate a new one at the moment it's needed
-// rather than storing/reusing a stale URL.
-async function mintAccountLink(
-  spoke: Spoke,
-  accountId: string,
-): Promise<string | null> {
-  const origin =
-    (await headers()).get("origin") ??
-    process.env.NEXT_PUBLIC_APP_URL ??
-    "http://localhost:3000";
-  const link = await spokeStripePost(spoke, "/account_links", {
-    account: accountId,
-    refresh_url: `${origin}/${spoke.slug}/onboarding`,
-    return_url: `${origin}/${spoke.slug}/onboarding`,
-    type: "account_onboarding",
-  });
-  if (link.error) return null;
-  return link.url ?? null;
-}
-
-// Create the Express account + an onboarding link. Stamps stripe_account_id on
-// the company immediately (stripe_onboarded stays false, so no funds route yet).
-export async function startStripeOnboarding(
-  slug: string,
-  input: {
-  companyId: string;
-  },
-): Promise<ActionResult<StripeStatus>> {
-  const owner = await requirePlatformOwner();
-  if (!spokeStripeConfigured(await loadSpoke(slug)))
-    return { ok: false, error: "Stripe secret key not configured." };
-
-  const spoke = await loadSpoke(slug);
-  const mgcj = spokeSupabase(spoke);
-  const { data: company } = await mgcj
-    .from("companies")
-    .select("name, stripe_account_id")
-    .eq("id", input.companyId)
-    .maybeSingle();
-  if (!company) return { ok: false, error: "Company not found." };
-
-  // Reuse an existing account if the step is being re-run.
-  let accountId = company.stripe_account_id as string | null;
-  if (!accountId) {
-    const acct = await spokeStripePost(spoke, "/accounts", {
-      type: "express",
-      country: "CA",
-      "capabilities[card_payments][requested]": "true",
-      "capabilities[transfers][requested]": "true",
-      "business_profile[name]": company.name,
-      "metadata[company_id]": input.companyId,
-    });
-    if (acct.error)
-      return { ok: false, error: acct.error.message ?? "Stripe account create failed." };
-    accountId = acct.id;
-
-    await mgcj
-      .from("companies")
-      .update({ stripe_account_id: accountId, stripe_onboarded: false })
-      .eq("id", input.companyId);
-
-    await writeAudit({
-      actorUserId: owner.id,
-      projectSlug: spoke.slug,
-      action: "stripe.account_create",
-      target: input.companyId,
-      after: { stripe_account_id: accountId },
-    });
-  }
-
-  const onboardingUrl = await mintAccountLink(spoke, accountId!);
-  if (!onboardingUrl)
-    return { ok: false, error: "Stripe link create failed." };
-
-  return {
-    ok: true,
-    data: {
-      accountId: accountId!,
-      onboardingUrl,
-      chargesEnabled: false,
-      payoutsEnabled: false,
-      detailsSubmitted: false,
-    },
-  };
-}
-
-// Poll Stripe for the account's readiness; flip stripe_onboarded once charges
-// are enabled (the gate all three payment functions key off). If it isn't ready
-// yet, mint a *fresh* onboarding link so the caller (Check status, or a resumed
-// run) always has a live link to hand the company — never a blanked-out field.
-export async function refreshStripeStatus(
-  slug: string,
-  input: {
-  companyId: string;
-  },
-): Promise<ActionResult<StripeStatus>> {
-  const owner = await requirePlatformOwner();
-
-  const spoke = await loadSpoke(slug);
-  const mgcj = spokeSupabase(spoke);
-  const { data: company } = await mgcj
-    .from("companies")
-    .select("stripe_account_id, stripe_onboarded")
-    .eq("id", input.companyId)
-    .maybeSingle();
-  if (!company?.stripe_account_id)
-    return { ok: false, error: "No Stripe account for this company yet." };
-
-  const acct = await spokeStripeGet(spoke, `/accounts/${company.stripe_account_id}`);
-  if (acct.error)
-    return { ok: false, error: acct.error.message ?? "Could not load Stripe account." };
-
-  const chargesEnabled = !!acct.charges_enabled;
-  if (chargesEnabled && !company.stripe_onboarded) {
-    await mgcj
-      .from("companies")
-      .update({ stripe_onboarded: true })
-      .eq("id", input.companyId);
-    await writeAudit({
-      actorUserId: owner.id,
-      projectSlug: spoke.slug,
-      action: "stripe.onboarded",
-      target: input.companyId,
-      after: { stripe_onboarded: true },
-    });
-  }
-
-  return {
-    ok: true,
-    data: {
-      accountId: company.stripe_account_id,
-      onboardingUrl: chargesEnabled
-        ? null
-        : await mintAccountLink(spoke, company.stripe_account_id),
-      chargesEnabled,
-      payoutsEnabled: !!acct.payouts_enabled,
-      detailsSubmitted: !!acct.details_submitted,
-    },
-  };
-}
-
 // ── Direct charges: the company's OWN Stripe account ────────────────
 // Design: mgcj-app/.claude/notes/direct-charges-design.md (§3, §11).
-//
-// Separate from the Express flow above, on separate columns
-// (stripe_direct_*). The live card flow still routes transfers off
-// stripe_account_id, so that flow and its columns stay as they are until
-// cutover.
 //
 // This is the ONLY place the account is created. Who pays Stripe's fees and
 // who owns a negative balance cannot be changed afterwards, so it is made
@@ -752,8 +592,8 @@ export async function createDirectAccount(
 //   • an admin profile         → admin created (required)
 //   • dispatcher profiles      → dispatchers seeded (optional step)
 //   • driver_invites rows      → invites minted (optional step)
-//   • stripe_account_id        → Stripe onboarding started
-//   • stripe_onboarded = true  → card-ready
+//   • stripe_direct_account_id            → the company's Stripe account exists
+//   • stripe_direct_card_status = active  → card-ready
 export type CompanyRow = {
   id: string;
   name: string;
@@ -773,7 +613,7 @@ export async function listCompanies(
 
   const { data: companies, error } = await mgcj
     .from("companies")
-    .select("id, name, stripe_account_id, stripe_onboarded")
+    .select("id, name, stripe_direct_account_id, stripe_direct_card_status")
     .order("name", { ascending: true });
   if (error) return { ok: false, error: error.message };
   if (!companies || companies.length === 0) return { ok: true, data: [] };
@@ -822,8 +662,8 @@ export async function listCompanies(
     adminName: adminByCompany.get(c.id) ?? null,
     dispatcherCount: dispatcherCountByCompany.get(c.id) ?? 0,
     inviteCount: inviteCountByCompany.get(c.id) ?? 0,
-    stripeAccountId: (c.stripe_account_id as string | null) ?? null,
-    stripeOnboarded: !!c.stripe_onboarded,
+    stripeAccountId: (c.stripe_direct_account_id as string | null) ?? null,
+    stripeOnboarded: c.stripe_direct_card_status === "active",
   }));
 
   return { ok: true, data: rows };
@@ -859,7 +699,7 @@ export async function getCompanyForEdit(
   const { data: company, error } = await mgcj
     .from("companies")
     .select(
-      "id, name, slug, platform_fee_percent, base_fare, rate_per_km, hst_number, billing_email, billing_address, statement_descriptor_suffix, tax_rate_percent, tax_label, stripe_account_id, stripe_onboarded",
+      "id, name, slug, platform_fee_percent, base_fare, rate_per_km, hst_number, billing_email, billing_address, statement_descriptor_suffix, tax_rate_percent, tax_label, stripe_direct_account_id, stripe_direct_card_status",
     )
     .eq("id", companyId)
     .maybeSingle();
@@ -893,8 +733,8 @@ export async function getCompanyForEdit(
       adminName: admin?.name ?? null,
       dispatcherCount: dispatcherCount ?? 0,
       inviteCount: inviteCount ?? 0,
-      stripeAccountId: (company.stripe_account_id as string | null) ?? null,
-      stripeOnboarded: !!company.stripe_onboarded,
+      stripeAccountId: (company.stripe_direct_account_id as string | null) ?? null,
+      stripeOnboarded: company.stripe_direct_card_status === "active",
       platformFeePercent: Number(company.platform_fee_percent),
       baseFare: Number(company.base_fare),
       ratePerKm: Number(company.rate_per_km),
