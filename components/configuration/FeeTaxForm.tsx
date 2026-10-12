@@ -50,9 +50,10 @@ export function FeeTaxForm({ slug }: { slug: string }) {
         Once Vellon is GST/HST-registered, its fee is taxed at each company&apos;s
         own rate, on top of the fee: taken with the fee on a card fare, and
         added to the monthly invoice on a cash fare. This switch is for{" "}
-        <span className="text-zinc-300">this project only</span>. Rides before
-        the date are never taxed, and changing it never rewrites a ride that
-        was already charged.
+        <span className="text-zinc-300">this project only</span>. Set it to
+        your GST/HST effective date <span className="text-zinc-300">before that
+        date arrives</span>: a ride&apos;s tax is fixed when it is charged, so
+        the switch never reaches back to rides already completed.
       </p>
 
       {error && (

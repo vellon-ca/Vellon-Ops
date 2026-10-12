@@ -165,8 +165,19 @@ export async function updateFeeTax(
       return { ok: false, error: "That is not a real date." };
     }
     // Production charges real companies real tax from this date, on documents
-    // that must carry the number. Refuse to turn it on without one.
+    // that must carry the number. Refuse to turn it on without one — and
+    // refuse a PAST date: a ride's rate is frozen when it completes, so rides
+    // between that date and now would stay untaxed while the date says Vellon
+    // owed tax on them. Set the date before it arrives.
     if (spoke.environment === "prod") {
+      if (input.registeredFromDate < atlanticDate(new Date().toISOString())) {
+        return {
+          ok: false,
+          error:
+            "That date has passed. Rides already completed since then were not taxed and " +
+            "cannot be taxed now, so production only accepts today or a future date.",
+        };
+      }
       const { data: settings } = await supabaseAdmin
         .from("platform_settings")
         .select("hst_number")
