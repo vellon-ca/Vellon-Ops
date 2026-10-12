@@ -253,6 +253,7 @@ export function RevenueDashboard({ slug }: { slug: string }) {
 const ROUTE_LABEL: Record<string, string> = {
   driver_transfer: "Paid to driver",
   company_transfer: "Paid to company",
+  direct: "Charged on company's account",
   platform_invoiced: "Held on platform",
   transfer_failed: "Transfer failed",
   transfer_reversed: "Reversed (dispute)",
@@ -276,7 +277,7 @@ const STATE_META: Record<
   paid_companies: {
     label: "Paid to companies",
     dot: "#3987e5",
-    sub: "company settles with drivers",
+    sub: "transferred, or charged on their own account",
   },
   held: {
     label: "Held / pending sweep",

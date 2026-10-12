@@ -273,6 +273,11 @@ export type SettlementState =
 const ROUTE_STATE: Record<string, SettlementState> = {
   driver_transfer: "paid_drivers",
   company_transfer: "paid_companies",
+  // Derived by ops_settlement_reconciliation, never stored: the ride was
+  // charged on the company's OWN Stripe account (direct charge). Nothing was
+  // transferred; the amount is what the company kept there after Vellon's
+  // application fee and Stripe's processing cost.
+  direct: "paid_companies",
   platform_invoiced: "held",
   transfer_reversed: "reversed",
   refund_reversed: "reversed",
@@ -1428,6 +1433,13 @@ export type RefundableRide = {
   blockedReason: string | null; // why not, if refundable === false
 };
 
+// A direct charge lives on the company's own Stripe account. A /refunds call
+// from here goes to Vellon's platform, where that PaymentIntent does not exist;
+// and the refund is the company's to give, out of its own balance. Returning
+// Vellon's fee on such a ride is an application-fee refund, not built yet.
+const DIRECT_CHARGE_REFUND_BLOCK =
+  "Charged on the company's own Stripe account — the company refunds it, not Vellon.";
+
 // Find a passenger's completed card rides by phone, newest first, annotated with
 // whether each can still be refunded. Phone match is a loose suffix contains —
 // operators paste whatever format the passenger gave them.
@@ -1464,7 +1476,7 @@ export async function searchRefundableRides(
     const { data: rides, error: rErr } = await mgcj
       .from("rides")
       .select(
-        "id, company_id, driver_id, passenger_id, completed_at, fare_final, payment_method, payment_status, stripe_payment_intent_id, stripe_dispute_id, refunded_amount_cents, settlement_route",
+        "id, company_id, driver_id, passenger_id, completed_at, fare_final, payment_method, payment_status, stripe_payment_intent_id, stripe_dispute_id, refunded_amount_cents, settlement_route, stripe_charge_account_id",
       )
       .in("passenger_id", [...passengerById.keys()])
       .eq("payment_method", "card")
@@ -1494,7 +1506,8 @@ export async function searchRefundableRides(
       const refundedCents = r.refunded_amount_cents ?? 0;
 
       let blockedReason: string | null = null;
-      if (r.stripe_dispute_id) blockedReason = "Charge is disputed — resolve the dispute, don't refund.";
+      if (r.stripe_charge_account_id) blockedReason = DIRECT_CHARGE_REFUND_BLOCK;
+      else if (r.stripe_dispute_id) blockedReason = "Charge is disputed — resolve the dispute, don't refund.";
       else if (!r.stripe_payment_intent_id) blockedReason = "No payment intent on this ride.";
       else if (r.payment_status !== "succeeded") {
         blockedReason =
@@ -1514,7 +1527,7 @@ export async function searchRefundableRides(
         fareFinal: r.fare_final,
         chargedCents,
         refundedCents,
-        settlementRoute: r.settlement_route,
+        settlementRoute: r.settlement_route ?? (r.stripe_charge_account_id ? "direct" : null),
         refundable: blockedReason === null,
         blockedReason,
       };
@@ -1550,7 +1563,7 @@ export async function refundRide(
     const { data: ride, error: rErr } = await mgcj
       .from("rides")
       .select(
-        "id, company_id, payment_method, payment_status, stripe_payment_intent_id, stripe_dispute_id, fare_final, refunded_amount_cents",
+        "id, company_id, payment_method, payment_status, stripe_payment_intent_id, stripe_dispute_id, fare_final, refunded_amount_cents, stripe_charge_account_id",
       )
       .eq("id", input.rideId)
       .maybeSingle();
@@ -1559,6 +1572,7 @@ export async function refundRide(
 
     // Guards — mirror searchRefundableRides so a stale UI can't push a bad refund.
     if (ride.payment_method !== "card") return { ok: false, error: "Not a card ride." };
+    if (ride.stripe_charge_account_id) return { ok: false, error: DIRECT_CHARGE_REFUND_BLOCK };
     if (ride.stripe_dispute_id)
       return { ok: false, error: "Charge is disputed — resolve the dispute instead of refunding." };
     if (!ride.stripe_payment_intent_id)
