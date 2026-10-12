@@ -15,7 +15,7 @@ import {
 import { supabaseAdmin } from "@/lib/supabase/admin";
 import { writeAudit } from "@/lib/audit";
 import { getPlatformSettings } from "@/app/(app)/[slug]/configuration/actions";
-import { buildInvoicePdf } from "@/lib/pdf/invoice";
+import { buildInvoicePdf, type InvoiceTaxLine } from "@/lib/pdf/invoice";
 import { buildInvoiceEmailHtml } from "@/lib/email/invoiceEmail";
 
 const RESEND_FROM_ADDRESS = "Vellon <billing@vellon.ca>";
@@ -67,6 +67,9 @@ type RevRow = {
   fares_total: number;
   fee_total: number;
   refund_total: number; // Vellon's realized loss from refunds (card-only)
+  // GST/HST on fee_total, summed per ride on the spoke. 0 while Vellon's fee is
+  // untaxed, and on a spoke that predates mgcj 20261013000000.
+  fee_tax_total: number;
 };
 
 export type RevenueSummary = {
@@ -116,6 +119,7 @@ async function fetchRevRows(
     fares_total: Number(r.fares_total),
     fee_total: Number(r.fee_total),
     refund_total: Number(r.refund_total ?? 0),
+    fee_tax_total: Number(r.fee_tax_total ?? 0),
   }));
 }
 
@@ -478,6 +482,13 @@ export type Invoice = {
   tax_rate_percent: number | null;
   tax_amount: number | null;
   total_due: number | null;
+  // 0009_invoice_card_section.sql. Vellon's fee on CARD fares, already
+  // collected through Stripe — shown on the document, never payable. NULL on
+  // rows generated before 0009.
+  card_fares_total: number | null;
+  card_fee_total: number | null;
+  card_tax_amount: number | null;
+  card_ride_count: number | null;
 };
 
 export async function listInvoices(
@@ -530,21 +541,31 @@ export async function generateInvoices(
     return { ok: false, error: (e as Error).message };
   }
 
-  // Cash fees per company for the month (RPC already groups by month/method,
-  // but sum defensively in case of any boundary duplication).
+  // Fees per company for the month, cash and card apart (the RPC already
+  // groups by month/method, but sum defensively in case of any boundary
+  // duplication). Cash is what the invoice bills; card was collected through
+  // Stripe at capture and is only stated.
+  type Side = { fares: number; fee: number; tax: number; rides: number };
   const perCompany = new Map<
     string,
-    { name: string; feePct: number; fares: number; feeTotal: number; rides: number }
+    { name: string; feePct: number; cash: Side; card: Side }
   >();
   for (const r of rows) {
-    if (r.payment_method !== "cash") continue;
+    const side = r.payment_method === "cash" ? "cash" : r.payment_method === "card" ? "card" : null;
+    if (!side) continue;
     const e =
       perCompany.get(r.company_id) ??
-      { name: r.company_name, feePct: r.fee_percent, fares: 0, feeTotal: 0, rides: 0 };
-    e.fares += r.fares_total;
-    e.feeTotal += r.fee_total;
-    e.rides += r.ride_count;
-    e.feePct = r.fee_percent;
+      {
+        name: r.company_name,
+        feePct: r.fee_percent,
+        cash: { fares: 0, fee: 0, tax: 0, rides: 0 },
+        card: { fares: 0, fee: 0, tax: 0, rides: 0 },
+      };
+    e[side].fares += r.fares_total;
+    e[side].fee += r.fee_total;
+    e[side].tax += r.fee_tax_total;
+    e[side].rides += r.ride_count;
+    if (side === "cash") e.feePct = r.fee_percent;
     e.name = r.company_name;
     perCompany.set(r.company_id, e);
   }
@@ -563,21 +584,32 @@ export async function generateInvoices(
 
   // ── Tax on the fee ────────────────────────────────────────────────────
   //
-  // TWO independent gates, one join apart (0008_invoice_tax.sql):
-  //   whether the FEE is taxed -> VELLON's registration (platform_settings)
-  //   whether the FARE is taxed -> the COMPANY's (mgcj companies.hst_number)
-  // Only the first one belongs here. As of 2026-10-01 Vellon is not
-  // registered, so every invoice generated today correctly carries no tax.
+  // WHETHER and HOW MUCH is decided on the spoke, per ride (mgcj
+  // 20261013000000): platform_fee_tax is the one switch card capture and this
+  // generator both read, and ops_revenue returns the per-ride tax already
+  // summed. Nothing is multiplied here — with a registration date inside the
+  // month only some rides carry tax, and round(fee x rate) would tax them all.
   //
-  // The RATE is the recipient's: a B2B service is rated at the customer's
-  // place of supply, so it comes from the billed company's jurisdiction, not
-  // Vellon's. Snapshotted onto the row below so the PDF never reads it live.
+  // platform_settings.hst_number is only the NUMBER PRINTED. So tax with no
+  // number is refused rather than issued: a tax line without the supplier's
+  // registration number is not a document the company can claim from.
   const settingsRes = await getPlatformSettings();
   if (!settingsRes.ok) return { ok: false, error: settingsRes.error };
-  const vellonRegistered = !!settingsRes.data.hstNumber;
+  const anyTax = [...perCompany.values()].some((e) => e.cash.tax > 0 || e.card.tax > 0);
+  if (anyTax && !settingsRes.data.hstNumber) {
+    return {
+      ok: false,
+      error:
+        "Fee tax was charged on rides this month, but Vellon's GST/HST number is " +
+        "empty. Enter it under Configuration, then generate again.",
+    };
+  }
 
+  // Label and nominal rate, for the document's tax line. The recipient's: a
+  // B2B service is rated at the customer's place of supply. Snapshotted onto
+  // the row so the PDF never reads it live.
   const taxByCompany = new Map<string, { label: string; ratePercent: number }>();
-  if (vellonRegistered) {
+  if (anyTax) {
     const mgcj = spokeSupabase(spoke);
     const { data: taxRows, error: taxErr } = await mgcj
       .from("companies")
@@ -591,31 +623,6 @@ export async function generateInvoices(
     }
   }
 
-  // Registered Vellon, unreadable rate: issue the invoice with NO tax line and
-  // say so loudly, rather than inventing a rate onto a tax document. Same call
-  // as send-ride-receipt makes in the mirror situation — and the cost lands on
-  // Vellon's own margin here, not on a false claim to a customer.
-  const taxFor = (companyId: string, fee: number) => {
-    if (!vellonRegistered) return null;
-    const t = taxByCompany.get(companyId);
-    if (!t) {
-      console.error(
-        `[generateInvoices] company ${companyId}: Vellon is tax-registered but ` +
-        `the company has no usable tax_rate_percent on spoke ${spoke.slug} — ` +
-        `invoicing the fee with NO tax line. Check that mgcj 20260930000000 and ` +
-        `20261001020000 are applied to that project.`,
-      );
-      return null;
-    }
-    return {
-      label: t.label,
-      ratePercent: t.ratePercent,
-      // EXCLUSIVE: on top of the fee, not extracted from it. Rounded once,
-      // here, and stored as the figure the document prints.
-      amount: round2(fee * (t.ratePercent / 100)),
-    };
-  };
-
   // Deterministic — same company/month always yields the same number, so
   // regenerating a draft never reassigns it.
   const yyyymm = first.slice(0, 4) + first.slice(5, 7);
@@ -623,29 +630,39 @@ export async function generateInvoices(
     `INV-${yyyymm}-${companyId.slice(0, 6)}`;
 
   const toUpsert = [...perCompany.entries()]
-    .filter(([companyId, e]) => e.fares > 0 && !locked.has(companyId))
+    .filter(([companyId, e]) => (e.cash.fares > 0 || e.card.fares > 0) && !locked.has(companyId))
     .map(([companyId, e]) => {
-      const fee = round2(e.feeTotal);
-      const tax = taxFor(companyId, fee);
+      const fee = round2(e.cash.fee);
+      const cashTax = round2(e.cash.tax);
+      const cardTax = round2(e.card.tax);
+      const taxed = cashTax > 0 || cardTax > 0;
+      const t = taxed ? taxByCompany.get(companyId) : undefined;
       return {
         project_slug: spoke.slug,
         company_id: companyId,
         company_name: e.name,
         period_month: first,
-        cash_fares_total: round2(e.fares),
+        cash_fares_total: round2(e.cash.fares),
         fee_percent: e.feePct,
         // Sourced from the RPC's own per-ride fee_total (frozen per-ride rate),
         // never re-derived from fares*feePct — a mid-period rate change means
         // feePct is only a blended display value, not something the dollar
         // amount can be recomputed from.
-        // Stays the FEE alone — the revenue rollup sums this column as revenue.
-        // The payable figure is total_due.
+        // Stays the cash FEE alone — the revenue rollup sums this column as
+        // revenue. The payable figure is total_due.
         amount_due: fee,
-        tax_label: tax?.label ?? null,
-        tax_rate_percent: tax?.ratePercent ?? null,
-        tax_amount: tax?.amount ?? null,
-        total_due: round2(fee + (tax?.amount ?? 0)),
-        ride_count: e.rides,
+        // The label/rate print beside whichever section carries tax. The
+        // company's current rate if it is readable, else a bare "Tax" line:
+        // the AMOUNT is what was actually charged either way.
+        tax_label: taxed ? (t?.label ?? "Tax") : null,
+        tax_rate_percent: taxed ? (t?.ratePercent ?? null) : null,
+        tax_amount: cashTax > 0 ? cashTax : null,
+        total_due: round2(fee + cashTax),
+        ride_count: e.cash.rides,
+        card_fares_total: round2(e.card.fares),
+        card_fee_total: round2(e.card.fee),
+        card_tax_amount: cardTax > 0 ? cardTax : null,
+        card_ride_count: e.card.rides,
         status: "draft",
         generated_by: owner.id,
         generated_at: new Date().toISOString(),
@@ -717,7 +734,7 @@ type BuiltInvoicePdf = {
   rideCount: number;
   /** The fee alone. `totalDue` is what the company owes. */
   amountDue: number;
-  tax: { label: string; ratePercent: number; amount: number } | null;
+  tax: InvoiceTaxLine | null;
   totalDue: number;
   paymentInstructions: string | null;
   mailingAddress: string | null;
@@ -737,7 +754,7 @@ async function buildAndStoreInvoicePdf(
   const { data: invoice, error: invErr } = await supabaseAdmin
     .from("invoices")
     .select(
-      "id, company_id, company_name, period_month, cash_fares_total, fee_percent, ride_count, amount_due, invoice_number, tax_label, tax_rate_percent, tax_amount, total_due",
+      "id, company_id, company_name, period_month, cash_fares_total, fee_percent, ride_count, amount_due, invoice_number, tax_label, tax_rate_percent, tax_amount, total_due, card_fares_total, card_fee_total, card_tax_amount, card_ride_count",
     )
     .eq("id", invoiceId)
     .maybeSingle();
@@ -772,13 +789,33 @@ async function buildAndStoreInvoicePdf(
   // no tax line was charged — which is every invoice generated before
   // 0008_invoice_tax.sql, and every one generated while Vellon is unregistered.
   // NULL total_due therefore reads as amount_due, never as 0.
-  const taxRate = invoice.tax_rate_percent == null ? null : Number(invoice.tax_rate_percent);
-  const tax =
-    taxRate != null && taxRate > 0 && invoice.tax_amount != null
+  //
+  // The label and rate describe the tax; each section has its own amount
+  // (cash payable, card already collected). The rate can be NULL beside a real
+  // amount (company rate unreadable at generation) — the line then prints
+  // without a percentage.
+  const taxMeta =
+    invoice.tax_label != null
       ? {
-          label: invoice.tax_label || "HST",
-          ratePercent: taxRate,
-          amount: Number(invoice.tax_amount),
+          label: invoice.tax_label,
+          ratePercent:
+            invoice.tax_rate_percent == null ? null : Number(invoice.tax_rate_percent),
+        }
+      : null;
+  const cashTaxAmount = invoice.tax_amount != null ? Number(invoice.tax_amount) : 0;
+  const tax =
+    taxMeta && cashTaxAmount > 0 ? { ...taxMeta, amount: cashTaxAmount } : null;
+  const cardRides = invoice.card_ride_count ?? 0;
+  const card =
+    cardRides > 0
+      ? {
+          faresTotal: Number(invoice.card_fares_total ?? 0),
+          rideCount: cardRides,
+          fee: Number(invoice.card_fee_total ?? 0),
+          tax:
+            taxMeta && invoice.card_tax_amount != null && Number(invoice.card_tax_amount) > 0
+              ? { ...taxMeta, amount: Number(invoice.card_tax_amount) }
+              : null,
         }
       : null;
   const totalDue =
@@ -795,6 +832,7 @@ async function buildAndStoreInvoicePdf(
     rideCount: invoice.ride_count,
     amountDue: Number(invoice.amount_due),
     tax,
+    card,
     totalDue,
     vellon: settingsRes.data,
   });

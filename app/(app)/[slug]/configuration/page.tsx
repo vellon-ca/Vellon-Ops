@@ -1,4 +1,5 @@
 import { ConfigurationForm } from "@/components/configuration/ConfigurationForm";
+import { FeeTaxForm } from "@/components/configuration/FeeTaxForm";
 
 export default async function ConfigurationPage({
   params,
@@ -9,6 +10,7 @@ export default async function ConfigurationPage({
   return (
     <div>
       <ConfigurationForm slug={slug} />
+      <FeeTaxForm slug={slug} />
     </div>
   );
 }

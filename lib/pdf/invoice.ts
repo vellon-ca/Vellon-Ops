@@ -10,6 +10,14 @@ import { PDFDocument, StandardFonts, rgb, type PDFFont, type PDFPage } from "pdf
 // omits each blank section entirely rather than printing "undefined" or a
 // placeholder on a document a real company receives.
 
+/** `ratePercent` NULL prints the line without a percentage. */
+export type InvoiceTaxLine = { label: string; ratePercent: number | null; amount: number };
+
+// WHAT THIS DOCUMENT MUST CARRY once it shows tax. CRA Memorandum 8-4, the
+// $500-and-over tier (thresholds $100 / $500 since 2021-04-20), which is the
+// superset: supplier's name, date, total, the tax charged, the supplier's
+// GST/HST registration number, the recipient's name, terms of payment, and a
+// description of the service. Each has a line below; do not drop one.
 export type InvoicePdfInput = {
   invoiceNumber: string;
   periodLabel: string; // e.g. "June 2026"
@@ -27,8 +35,20 @@ export type InvoicePdfInput = {
    * off the company, so an issued document cannot be rewritten by a later
    * rate change. Tax is EXCLUSIVE here: added to the fee, not extracted.
    */
-  tax: { label: string; ratePercent: number; amount: number } | null;
-  /** amountDue + tax. Equals amountDue when `tax` is null. */
+  tax: InvoiceTaxLine | null;
+  /**
+   * Vellon's fee on CARD fares: collected through Stripe when each fare was
+   * charged, so stated here and never payable. NULL = no card rides this
+   * period. Its tax line is what lets the company claim the input tax credit
+   * on fees it never received a bill for.
+   */
+  card: {
+    faresTotal: number;
+    rideCount: number;
+    fee: number;
+    tax: InvoiceTaxLine | null;
+  } | null;
+  /** amountDue + tax (cash only). Equals amountDue when `tax` is null. */
   totalDue: number;
   vellon: {
     legalName: string | null;
@@ -89,10 +109,12 @@ export async function buildInvoicePdf(input: InvoicePdfInput): Promise<Uint8Arra
   // defect: it asserts a taxable supply the invoice never charged for. One
   // gate, so the two halves of that claim cannot disagree. (BN is not a tax
   // claim and prints whenever it is configured.)
+  // "Either section": a month of card rides only still charged tax.
+  const anyTax = input.tax ?? input.card?.tax ?? null;
   const regNumbers = [
     input.vellon.businessNumber ? `BN: ${input.vellon.businessNumber}` : null,
-    input.tax && input.vellon.hstNumber
-      ? `${input.tax.label} Reg: ${input.vellon.hstNumber}`
+    anyTax && input.vellon.hstNumber
+      ? `${anyTax.label} Reg: ${input.vellon.hstNumber}`
       : null,
   ]
     .filter(Boolean)
@@ -127,23 +149,50 @@ export async function buildInvoicePdf(input: InvoicePdfInput): Promise<Uint8Arra
   draw("Description", left + 6, y, { size: 9, color: gray });
   draw("Amount", right - 6, y, { size: 9, color: gray, align: "right" });
 
-  y -= 24;
-  draw(`Cash fares this period (${input.rideCount} ride${input.rideCount === 1 ? "" : "s"})`, left + 6, y, {
-    size: 11,
+  const taxText = (t: InvoiceTaxLine) =>
+    t.ratePercent != null ? `${t.label} (${formatRate(t.ratePercent)}%)` : t.label;
+  const money = (n: number) => `$${n.toFixed(2)}`;
+  const row = (text: string, amount: string, strong = false) => {
+    draw(text, left + 6, y, strong ? { size: 11 } : { size: 10, color: gray });
+    draw(amount, right - 6, y, strong ? { size: 11, align: "right" } : { size: 10, color: gray, align: "right" });
+  };
+  const plural = (n: number) => `${n} ride${n === 1 ? "" : "s"}`;
+
+  // The service, described once (8-4: "sufficient to identify it").
+  y -= 22;
+  draw(`Vellon Dispatch platform fee — dispatch software service, ${input.periodLabel}`, left + 6, y, {
+    size: 10,
   });
-  draw(`$${input.cashFaresTotal.toFixed(2)}`, right - 6, y, { size: 11, align: "right" });
 
-  y -= 20;
-  draw(`Platform fee (${input.feePercent}%)`, left + 6, y, { size: 10, color: gray });
-  draw(`$${input.amountDue.toFixed(2)}`, right - 6, y, { size: 10, color: gray, align: "right" });
-
+  // ── Cash fares: fee payable ───────────────────────────────────────────
+  y -= 24;
+  draw("CASH FARES — FEE PAYABLE", left + 6, y, { size: 9, color: gray });
+  y -= 18;
+  row(`Cash fares this period (${plural(input.rideCount)})`, money(input.cashFaresTotal), true);
+  y -= 18;
+  row(`Platform fee (${input.feePercent}%)`, money(input.amountDue));
   if (input.tax) {
-    y -= 20;
-    draw(`${input.tax.label} (${formatRate(input.tax.ratePercent)}%)`, left + 6, y, {
-      size: 10,
-      color: gray,
-    });
-    draw(`$${input.tax.amount.toFixed(2)}`, right - 6, y, { size: 10, color: gray, align: "right" });
+    y -= 18;
+    row(taxText(input.tax), money(input.tax.amount));
+  }
+
+  // ── Card fares: fee already collected ─────────────────────────────────
+  if (input.card) {
+    y -= 26;
+    draw("CARD FARES — FEE ALREADY COLLECTED", left + 6, y, { size: 9, color: gray });
+    y -= 18;
+    row(`Card fares this period (${plural(input.card.rideCount)})`, money(input.card.faresTotal), true);
+    y -= 18;
+    row("Platform fee", money(input.card.fee));
+    if (input.card.tax) {
+      y -= 18;
+      row(taxText(input.card.tax), money(input.card.tax.amount));
+    }
+    y -= 18;
+    row(
+      "Collected through Stripe when each fare was charged",
+      `-${money(input.card.fee + (input.card.tax?.amount ?? 0))}`,
+    );
   }
 
   y -= 22;
@@ -152,9 +201,20 @@ export async function buildInvoicePdf(input: InvoicePdfInput): Promise<Uint8Arra
   // ── Total ─────────────────────────────────────────────────────────────
   y -= 18;
   draw("Amount due", left + 6, y, { size: 13, font: bold });
-  draw(`$${input.totalDue.toFixed(2)}`, right - 6, y, { size: 13, font: bold, align: "right" });
+  draw(money(input.totalDue), right - 6, y, { size: 13, font: bold, align: "right" });
 
-  y -= 22;
+  // Terms of payment (8-4). Card fees need none: they are already paid.
+  y -= 16;
+  draw(
+    input.totalDue > 0
+      ? "Terms: cash-fare fees are due on receipt. Card-fare fees were paid at the time of each charge."
+      : "Terms: nothing is payable. Card-fare fees were paid at the time of each charge.",
+    left + 6,
+    y,
+    { size: 9, color: gray },
+  );
+
+  y -= 18;
   rule(y);
 
   // ── Payment instructions — omitted entirely if not yet configured ─────
@@ -166,7 +226,7 @@ export async function buildInvoicePdf(input: InvoicePdfInput): Promise<Uint8Arra
 
   // ── Footer ────────────────────────────────────────────────────────────
   rule(62);
-  draw(`${vellonName} — platform fee invoice for cash rides via Vellon dispatch`, left, 50, {
+  draw(`${vellonName} — monthly platform fee statement and invoice, Vellon Dispatch`, left, 50, {
     size: 8,
     color: gray,
   });
