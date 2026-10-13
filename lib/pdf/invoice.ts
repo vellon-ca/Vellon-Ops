@@ -67,6 +67,13 @@ export type InvoicePdfInput = {
     mailingAddress: string | null;
     paymentInstructions: string | null;
   };
+  /**
+   * Set only for an unsaved preview: the text of a banner across the top. It
+   * also prints a placeholder where a missing GST/HST number would otherwise
+   * leave the registration line out, since the real generator refuses that
+   * case and a preview does not.
+   */
+  preview?: string | null;
 };
 
 export async function buildInvoicePdf(input: InvoicePdfInput): Promise<Uint8Array> {
@@ -103,6 +110,11 @@ export async function buildInvoicePdf(input: InvoicePdfInput): Promise<Uint8Arra
 
   let y = 742;
 
+  if (input.preview) {
+    page.drawRectangle({ x: 0, y: 768, width: 612, height: 24, color: rgb(0.75, 0.15, 0.15) });
+    page.drawText(input.preview, { x: left, y: 776, size: 9, font: bold, color: rgb(1, 1, 1) });
+  }
+
   // ── Header ──────────────────────────────────────────────────────────
   draw(vellonName, left, y, { size: 18, font: bold });
   draw("INVOICE", right, y, { size: 20, font: bold, align: "right" });
@@ -125,7 +137,9 @@ export async function buildInvoicePdf(input: InvoicePdfInput): Promise<Uint8Arra
     input.vellon.businessNumber ? `BN: ${input.vellon.businessNumber}` : null,
     anyTax && input.vellon.hstNumber
       ? `${anyTax.label} Reg: ${input.vellon.hstNumber}`
-      : null,
+      : anyTax && input.preview
+        ? `${anyTax.label} Reg: [not set]`
+        : null,
   ]
     .filter(Boolean)
     .join("   ");

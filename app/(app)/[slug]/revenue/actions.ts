@@ -642,7 +642,67 @@ export async function generateInvoices(
     if (b) return b;
     throw e;
   }
-  const { start, next, first } = monthBounds(input.month);
+  const computed = await computeInvoiceRows(spoke, input.month);
+  if (!computed.ok) return computed;
+  const { first } = computed;
+
+  // Existing invoices for the month — skip regenerating locked (sent/paid) ones.
+  const { data: existing } = await supabaseAdmin
+    .from("invoices")
+    .select("company_id, status")
+    .eq("project_slug", spoke.slug)
+    .eq("period_month", first);
+  const locked = new Set(
+    (existing ?? [])
+      .filter((i) => i.status === "sent" || i.status === "paid")
+      .map((i) => i.company_id),
+  );
+
+  const generatedAt = new Date().toISOString();
+  const toUpsert = computed.rows
+    .filter((r) => !locked.has(r.company_id))
+    .map((r) => ({
+      ...r,
+      status: "draft",
+      generated_by: owner.id,
+      generated_at: generatedAt,
+    }));
+
+  if (toUpsert.length > 0) {
+    const { error } = await supabaseAdmin
+      .from("invoices")
+      .upsert(toUpsert, { onConflict: "project_slug,company_id,period_month" });
+    if (error) return { ok: false, error: error.message };
+    await writeAudit({
+      actorUserId: owner.id,
+      projectSlug: spoke.slug,
+      action: "invoices.generate",
+      target: first,
+      after: { month: input.month, count: toUpsert.length },
+    });
+  }
+
+  return listInvoices(slug, { month: input.month });
+}
+
+// One company's document for a month, as the hub's `invoices` row carries it.
+type ComputedInvoice = InvoicePdfRow & { project_slug: string };
+
+// The month's documents, computed from live spoke data. Writes nothing. Shared
+// by generateInvoices (which saves the rows) and previewInvoices (which never
+// does), so a preview shows what the real button would produce.
+//
+// `allowMissingHstNumber` is for the preview alone: platform_settings is one
+// row shared with production, so a dev spoke with the tax switch on cannot be
+// made to pass the refusal below by typing a number in.
+async function computeInvoiceRows(
+  spoke: Spoke,
+  month: string, // 'YYYY-MM'
+  opts: { allowMissingHstNumber?: boolean } = {},
+): Promise<
+  { ok: true; first: string; rows: ComputedInvoice[] } | { ok: false; error: string }
+> {
+  const { start, next, first } = monthBounds(month);
 
   let rows: RevRow[];
   try {
@@ -707,18 +767,6 @@ export async function generateInvoices(
     }
   }
 
-  // Existing invoices for the month — skip regenerating locked (sent/paid) ones.
-  const { data: existing } = await supabaseAdmin
-    .from("invoices")
-    .select("company_id, status")
-    .eq("project_slug", spoke.slug)
-    .eq("period_month", first);
-  const locked = new Set(
-    (existing ?? [])
-      .filter((i) => i.status === "sent" || i.status === "paid")
-      .map((i) => i.company_id),
-  );
-
   // ── Tax on the fee ────────────────────────────────────────────────────
   //
   // WHETHER and HOW MUCH is decided on the spoke, per ride (mgcj
@@ -735,7 +783,7 @@ export async function generateInvoices(
   const anyTax =
     [...perCompany.values()].some((e) => e.cash.tax > 0 || e.card.tax > 0) ||
     returns.some((f) => f.tax > 0);
-  if (anyTax && !settingsRes.data.hstNumber) {
+  if (anyTax && !settingsRes.data.hstNumber && !opts.allowMissingHstNumber) {
     return {
       ok: false,
       error:
@@ -768,11 +816,10 @@ export async function generateInvoices(
   const invoiceNumber = (companyId: string) =>
     `INV-${yyyymm}-${companyId.slice(0, 6)}`;
 
-  const toUpsert = [...perCompany.entries()]
+  const out: ComputedInvoice[] = [...perCompany.entries()]
     .filter(
       ([companyId, e]) =>
-        (e.cash.fares > 0 || e.card.fares > 0 || returnedBy.has(companyId)) &&
-        !locked.has(companyId),
+        e.cash.fares > 0 || e.card.fares > 0 || returnedBy.has(companyId),
     )
     .map(([companyId, e]) => {
       const fee = round2(e.cash.fee);
@@ -810,28 +857,11 @@ export async function generateInvoices(
         card_fee_returned: ret ? round2(ret.fee) : null,
         card_tax_returned: ret && ret.tax > 0 ? round2(ret.tax) : null,
         card_fee_return_count: ret ? ret.count : null,
-        status: "draft",
-        generated_by: owner.id,
-        generated_at: new Date().toISOString(),
         invoice_number: invoiceNumber(companyId),
       };
     });
 
-  if (toUpsert.length > 0) {
-    const { error } = await supabaseAdmin
-      .from("invoices")
-      .upsert(toUpsert, { onConflict: "project_slug,company_id,period_month" });
-    if (error) return { ok: false, error: error.message };
-    await writeAudit({
-      actorUserId: owner.id,
-      projectSlug: spoke.slug,
-      action: "invoices.generate",
-      target: first,
-      after: { month: input.month, count: toUpsert.length },
-    });
-  }
-
-  return listInvoices(slug, { month: input.month });
+  return { ok: true, first, rows: out };
 }
 
 export async function updateInvoiceStatus(
@@ -908,6 +938,66 @@ async function buildAndStoreInvoicePdf(
   if (invErr) return { ok: false, error: invErr.message };
   if (!invoice) return { ok: false, error: "Invoice not found." };
 
+  const rendered = await renderInvoicePdf(spoke, invoice);
+  if (!rendered.ok) return rendered;
+  const { pdfBytes } = rendered.data;
+
+  // Namespaced by spoke. Dev mgcj is a RESTORED COPY of prod, so company UUIDs
+  // are identical across the two — with a hardcoded "mgcj/" prefix and
+  // upsert:true below, a dev-spoke PDF silently overwrote the prod invoice
+  // PDF for the same company and month.
+  const pdfPath = `${spoke.slug}/${invoice.company_id}/${invoice.period_month}.pdf`;
+  const { error: uploadErr } = await supabaseAdmin.storage
+    .from("invoices")
+    .upload(pdfPath, Buffer.from(pdfBytes), {
+      contentType: "application/pdf",
+      upsert: true,
+    });
+  if (uploadErr) return { ok: false, error: uploadErr.message };
+
+  const { error: updateErr } = await supabaseAdmin
+    .from("invoices")
+    .update({ pdf_path: pdfPath })
+    .eq("id", invoiceId);
+  if (updateErr) return { ok: false, error: updateErr.message };
+
+  return { ok: true, data: { ...rendered.data, pdfPath } };
+}
+
+// The columns of an `invoices` row the PDF is drawn from. A saved row has an
+// id; one computed for a preview does not.
+type InvoicePdfRow = Pick<
+  Invoice,
+  | "company_id"
+  | "company_name"
+  | "period_month"
+  | "cash_fares_total"
+  | "fee_percent"
+  | "ride_count"
+  | "amount_due"
+  | "invoice_number"
+  | "tax_label"
+  | "tax_rate_percent"
+  | "tax_amount"
+  | "total_due"
+  | "card_fares_total"
+  | "card_fee_total"
+  | "card_tax_amount"
+  | "card_ride_count"
+  | "card_fee_returned"
+  | "card_tax_returned"
+  | "card_fee_return_count"
+> & { id?: string };
+
+// Row -> PDF bytes. Reads the company's billing details and platform settings;
+// writes nothing. `preview` is the banner text of an unsaved preview.
+async function renderInvoicePdf(
+  spoke: Spoke,
+  invoice: InvoicePdfRow,
+  preview?: string,
+): Promise<
+  { ok: true; data: Omit<BuiltInvoicePdf, "pdfPath"> } | { ok: false; error: string }
+> {
   const mgcj = spokeSupabase(spoke);
   const { data: company, error: companyErr } = await mgcj
     .from("companies")
@@ -929,7 +1019,11 @@ async function buildAndStoreInvoicePdf(
     year: "numeric",
     timeZone: "UTC",
   });
-  const invoiceNumber = invoice.invoice_number ?? `INV-${invoice.id.slice(0, 8).toUpperCase()}`;
+  const savedNumber =
+    invoice.invoice_number ?? `INV-${(invoice.id ?? "").slice(0, 8).toUpperCase()}`;
+  // Dev is a restored copy of prod, so the same company and month yield the
+  // same number there. A preview must not carry a real invoice's number.
+  const invoiceNumber = preview ? `PREVIEW-${savedNumber}` : savedNumber;
 
   // Read off the INVOICE ROW, never live off the company: an issued tax
   // document must not be rewritten by a later rate change. A NULL rate means
@@ -994,32 +1088,13 @@ async function buildAndStoreInvoicePdf(
     card,
     totalDue,
     vellon: settingsRes.data,
+    preview: preview ?? null,
   });
-
-  // Namespaced by spoke. Dev mgcj is a RESTORED COPY of prod, so company UUIDs
-  // are identical across the two — with a hardcoded "mgcj/" prefix and
-  // upsert:true below, a dev-spoke PDF silently overwrote the prod invoice
-  // PDF for the same company and month.
-  const pdfPath = `${spoke.slug}/${invoice.company_id}/${invoice.period_month}.pdf`;
-  const { error: uploadErr } = await supabaseAdmin.storage
-    .from("invoices")
-    .upload(pdfPath, Buffer.from(pdfBytes), {
-      contentType: "application/pdf",
-      upsert: true,
-    });
-  if (uploadErr) return { ok: false, error: uploadErr.message };
-
-  const { error: updateErr } = await supabaseAdmin
-    .from("invoices")
-    .update({ pdf_path: pdfPath })
-    .eq("id", invoiceId);
-  if (updateErr) return { ok: false, error: updateErr.message };
 
   return {
     ok: true,
     data: {
       pdfBytes,
-      pdfPath,
       invoiceNumber,
       companyName: invoice.company_name,
       periodLabel,
@@ -1050,6 +1125,41 @@ export async function previewInvoicePdf(
   const built = await buildAndStoreInvoicePdf(spoke, input.id);
   if (!built.ok) return built;
   return getInvoicePdfUrl(slug, { pdfPath: built.data.pdfPath });
+}
+
+// What "Generate / refresh drafts" would produce for the month, rendered and
+// handed straight back. Saves nothing: no `invoices` row, no stored PDF (that
+// bucket is on the hub too), no email — which is why it needs no write gate
+// and is the only way to see the document on a dev spoke. The bytes travel as
+// base64 because there is nowhere to sign a URL for.
+export async function previewInvoices(
+  slug: string,
+  input: {
+  month: string; // 'YYYY-MM'
+  },
+): Promise<
+  | { ok: true; data: { companyName: string; invoiceNumber: string; pdfBase64: string }[] }
+  | { ok: false; error: string }
+> {
+  await requirePlatformOwner();
+  const spoke = await loadSpoke(slug);
+  const computed = await computeInvoiceRows(spoke, input.month, {
+    allowMissingHstNumber: true,
+  });
+  if (!computed.ok) return computed;
+
+  const banner = `PREVIEW — not an invoice — ${spoke.slug} (${spoke.environment}) data, nothing saved`;
+  const out: { companyName: string; invoiceNumber: string; pdfBase64: string }[] = [];
+  for (const row of computed.rows) {
+    const rendered = await renderInvoicePdf(spoke, row, banner);
+    if (!rendered.ok) return rendered;
+    out.push({
+      companyName: rendered.data.companyName,
+      invoiceNumber: rendered.data.invoiceNumber,
+      pdfBase64: Buffer.from(rendered.data.pdfBytes).toString("base64"),
+    });
+  }
+  return { ok: true, data: out };
 }
 
 // Generate the PDF and email it to the company's billing contact, then flip

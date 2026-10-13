@@ -8,6 +8,7 @@ import {
   updateInvoiceStatus,
   sendInvoice,
   previewInvoicePdf,
+  previewInvoices,
   syncDisputeCosts,
   getDisputeCosts,
   getStrandedSettlements,
@@ -1078,6 +1079,36 @@ function InvoiceSection({ slug }: { slug: string }) {
     });
   };
 
+  // The month's documents as Generate would make them, opened without saving
+  // anything — the one invoice action a dev spoke allows.
+  // Shown as links, not opened: a month can hold several companies and a
+  // browser lets a click open one tab at most.
+  const [previews, setPreviews] = useState<{ label: string; url: string }[]>([]);
+  useEffect(() => {
+    setPreviews((old) => {
+      old.forEach((p) => URL.revokeObjectURL(p.url));
+      return [];
+    });
+  }, [month]);
+  const previewMonth = () => {
+    startTransition(async () => {
+      const res = await previewInvoices(slug, { month });
+      if (!res.ok) return setError(res.error);
+      if (res.data.length === 0) return setError("Nothing to invoice for this month.");
+      setError(null);
+      setPreviews((old) => {
+        old.forEach((p) => URL.revokeObjectURL(p.url));
+        return res.data.map((d) => {
+          const bytes = Uint8Array.from(atob(d.pdfBase64), (c) => c.charCodeAt(0));
+          return {
+            label: `${d.companyName} — ${d.invoiceNumber}`,
+            url: URL.createObjectURL(new Blob([bytes], { type: "application/pdf" })),
+          };
+        });
+      });
+    });
+  };
+
   // TWO figures, named apart on purpose. `amount_due` is the platform FEE and
   // is what the revenue rollup treats as revenue; the payable figure on a taxed
   // invoice is fee + tax, which is a receivable and not revenue. A single
@@ -1103,6 +1134,14 @@ function InvoiceSection({ slug }: { slug: string }) {
             className="rounded-md border border-zinc-800 bg-zinc-950 px-2 py-1 text-sm text-zinc-200"
           />
           <button
+            onClick={previewMonth}
+            disabled={pending}
+            title="Opens each company's PDF for this month. Nothing is saved or sent."
+            className="rounded-md border border-zinc-700 px-3 py-1.5 text-sm font-medium text-zinc-200 hover:bg-zinc-800 disabled:opacity-50"
+          >
+            Preview (not saved)
+          </button>
+          <button
             onClick={generate}
             disabled={pending}
             className="rounded-md bg-accent px-3 py-1.5 text-sm font-medium text-white hover:bg-accent-hover disabled:opacity-50"
@@ -1120,6 +1159,21 @@ function InvoiceSection({ slug }: { slug: string }) {
         <p className="mt-3 rounded-md border border-red-900/50 bg-red-950/40 px-3 py-2 text-sm text-red-300">
           {error}
         </p>
+      )}
+
+      {previews.length > 0 && (
+        <div className="mt-3 rounded-md border border-zinc-800 px-3 py-2 text-sm text-zinc-300">
+          <p className="text-xs text-zinc-500">Previews for this month — nothing was saved or sent.</p>
+          <ul className="mt-1 space-y-1">
+            {previews.map((p) => (
+              <li key={p.url}>
+                <a href={p.url} target="_blank" rel="noreferrer" className="text-accent hover:underline">
+                  {p.label}
+                </a>
+              </li>
+            ))}
+          </ul>
+        </div>
       )}
 
       <div className="mt-3 overflow-x-auto rounded-xl border border-zinc-800">
