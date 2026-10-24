@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState, useTransition } from "react";
-import { slugPreview } from "@/lib/companyIdentity";
+import { COMPANY_TIMEZONES, slugPreview } from "@/lib/companyIdentity";
 import { useSearchParams } from "next/navigation";
 import {
   createCompany,
@@ -30,6 +30,7 @@ type CompanyInput = {
   hstNumber: string;
   billingEmail: string;
   billingAddress: string;
+  timezone: string;
 };
 
 // The first step of a resumed company that still has real work left. Company +
@@ -114,6 +115,7 @@ export function OnboardingWizard({ slug }: { slug: string }) {
         hstNumber: data.hstNumber,
         billingEmail: data.billingEmail,
         billingAddress: data.billingAddress,
+        timezone: data.timezone,
         slug: data.slug,
         studentDiscountEnabled: false,
         force,
@@ -191,6 +193,7 @@ export function OnboardingWizard({ slug }: { slug: string }) {
                   hstNumber: String(f.get("hst") || ""),
                   billingEmail: String(f.get("billingEmail") || ""),
                   billingAddress: String(f.get("billingAddress") || ""),
+                  timezone: String(f.get("timezone") || ""),
                 },
                 false,
               );
@@ -253,6 +256,25 @@ export function OnboardingWizard({ slug }: { slug: string }) {
                   className={input}
                 />
               </div>
+            </div>
+            <div className="space-y-1.5">
+              <label className={label}>Time zone</label>
+              {/* No preselection on purpose: a default would quietly put an
+                  Ontario company on Atlantic time. */}
+              <select name="timezone" required defaultValue="" className={input}>
+                <option value="" disabled>
+                  Choose where the company operates…
+                </option>
+                {COMPANY_TIMEZONES.map((z) => (
+                  <option key={z.zone} value={z.zone}>
+                    {z.label}
+                  </option>
+                ))}
+              </select>
+              <p className="text-xs text-zinc-500">
+                Every time the company&rsquo;s apps, dashboard, SMS and receipts
+                show is in this zone, and it sets the invoicing month.
+              </p>
             </div>
             <div className="space-y-1.5">
               <label className={label}>HST number (optional)</label>

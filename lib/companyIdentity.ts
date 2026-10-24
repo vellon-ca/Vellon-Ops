@@ -134,3 +134,30 @@ export function taxLinePreview(label: string, rate: number): string {
   const r = Number.isFinite(rate) ? String(Number(rate.toFixed(2))) : "?";
   return `${l} (${r}%)`;
 }
+
+/**
+ * The zones a company may run on — `companies.timezone`'s CHECK allowlist
+ * (mgcj-app migration 20261024020000), in the same order. Every wall-clock
+ * time the company's apps, dashboard, SMS and receipts show is in this zone,
+ * and the invoicing month (ops_revenue) is its local month.
+ *
+ * A closed list on purpose: the mobile app's Intl polyfill throws on a zone it
+ * does not carry. Extend it only together with that migration's allowlist.
+ */
+export const COMPANY_TIMEZONES: ReadonlyArray<{ zone: string; label: string }> = [
+  { zone: "America/St_Johns", label: "Newfoundland (St. John's)" },
+  { zone: "America/Halifax", label: "Atlantic (Halifax)" },
+  { zone: "America/Toronto", label: "Eastern (Toronto)" },
+  { zone: "America/Winnipeg", label: "Central (Winnipeg)" },
+  { zone: "America/Regina", label: "Saskatchewan (Regina, no DST)" },
+  { zone: "America/Edmonton", label: "Mountain (Edmonton)" },
+  { zone: "America/Vancouver", label: "Pacific (Vancouver)" },
+  { zone: "America/Whitehorse", label: "Yukon (Whitehorse, no DST)" },
+];
+
+export function validateTimeZone(zone: string): string | null {
+  if (!zone) return "Choose the company's time zone.";
+  return COMPANY_TIMEZONES.some((z) => z.zone === zone)
+    ? null
+    : `"${zone}" is not one of the supported time zones.`;
+}

@@ -13,6 +13,7 @@ import {
   taxLinePreview,
   validateTaxLabel,
   TAX_LABEL_MAX,
+  COMPANY_TIMEZONES,
 } from "@/lib/companyIdentity";
 
 const input =
@@ -76,6 +77,7 @@ export function EditCompanyModal({
         statementDescriptorSuffix: suffix,
         taxRatePercent: Number(f.get("taxRate")),
         taxLabel,
+        timezone: String(f.get("timezone") || ""),
       });
       if (!res.ok) return setError(res.error);
       onSaved();
@@ -154,6 +156,26 @@ export function EditCompanyModal({
                   className={input}
                 />
               </div>
+            </div>
+            <div className="space-y-1.5">
+              <label className={label}>Time zone</label>
+              <select
+                name="timezone"
+                required
+                defaultValue={company.timezone}
+                className={input}
+              >
+                {COMPANY_TIMEZONES.map((z) => (
+                  <option key={z.zone} value={z.zone}>
+                    {z.label}
+                  </option>
+                ))}
+              </select>
+              <p className="text-xs text-zinc-500">
+                Moves every time this company&rsquo;s apps, dashboard, SMS and
+                receipts show, and which month a ride is invoiced in. Change it
+                only between invoice runs.
+              </p>
             </div>
             <div className="space-y-1.5">
               <label className={label}>HST number (optional)</label>

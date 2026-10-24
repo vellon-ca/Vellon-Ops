@@ -15,6 +15,7 @@ import {
   validateSuffix,
   validateTaxRate,
   validateTaxLabel,
+  validateTimeZone,
 } from "@/lib/companyIdentity";
 
 export type ActionResult<T> =
@@ -34,6 +35,9 @@ export async function createCompany(
   billingAddress?: string;
   studentDiscountEnabled: boolean;
   studentDiscountPct?: number;
+  // Required: companies.timezone is NOT NULL with no default, on purpose — a
+  // Halifax default would quietly run an Ontario company an hour off.
+  timezone: string;
   // Optional. Blank -> derived from the name by mgcj's trg_set_company_slug.
   // Supplied -> used verbatim, because the slug is what the mobile build's
   // COMPANY_SLUG resolves against.
@@ -51,6 +55,8 @@ export async function createCompany(
     return { ok: false, error: "Platform fee must be between 0 and 100%." };
   if (input.baseFare < 0 || input.ratePerKm < 0)
     return { ok: false, error: "Fare values can't be negative." };
+  const zoneError = validateTimeZone(input.timezone);
+  if (zoneError) return { ok: false, error: zoneError };
 
   const spoke = await loadSpoke(slug);
   const mgcj = spokeSupabase(spoke);
@@ -95,6 +101,7 @@ export async function createCompany(
       hst_number: input.hstNumber?.trim() || null,
       billing_email: input.billingEmail?.trim() || null,
       billing_address: input.billingAddress?.trim() || null,
+      timezone: input.timezone,
       student_discount_enabled: input.studentDiscountEnabled,
       student_discount_pct: input.studentDiscountEnabled
         ? (input.studentDiscountPct ?? 0)
@@ -686,6 +693,8 @@ export type CompanyDetail = CompanyRow & {
   taxRatePercent: number;
   /** What the tax is CALLED on documents — HST, GST, 'GST + QST'. */
   taxLabel: string;
+  /** IANA zone; one of COMPANY_TIMEZONES. */
+  timezone: string;
 };
 
 export async function getCompanyForEdit(
@@ -699,7 +708,7 @@ export async function getCompanyForEdit(
   const { data: company, error } = await mgcj
     .from("companies")
     .select(
-      "id, name, slug, platform_fee_percent, base_fare, rate_per_km, hst_number, billing_email, billing_address, statement_descriptor_suffix, tax_rate_percent, tax_label, stripe_direct_account_id, stripe_direct_card_status",
+      "id, name, slug, platform_fee_percent, base_fare, rate_per_km, hst_number, billing_email, billing_address, statement_descriptor_suffix, tax_rate_percent, tax_label, timezone, stripe_direct_account_id, stripe_direct_card_status",
     )
     .eq("id", companyId)
     .maybeSingle();
@@ -746,6 +755,7 @@ export async function getCompanyForEdit(
         (company.statement_descriptor_suffix as string | null) ?? null,
       taxRatePercent: Number(company.tax_rate_percent),
       taxLabel: (company.tax_label as string | null) || "HST",
+      timezone: company.timezone as string,
     },
   };
 }
@@ -765,6 +775,7 @@ export async function updateCompany(
   statementDescriptorSuffix?: string;
   taxRatePercent: number;
   taxLabel: string;
+  timezone: string;
   },
 ): Promise<ActionResult<{ companyId: string }>> {
   const owner = await requirePlatformOwner();
@@ -794,13 +805,16 @@ export async function updateCompany(
   const taxLabelError = validateTaxLabel(taxLabel);
   if (taxLabelError) return { ok: false, error: taxLabelError };
 
+  const zoneError = validateTimeZone(input.timezone);
+  if (zoneError) return { ok: false, error: zoneError };
+
   const spoke = await loadSpoke(slug);
   const mgcj = spokeSupabase(spoke);
 
   const { data: before } = await mgcj
     .from("companies")
     .select(
-      "name, slug, platform_fee_percent, base_fare, rate_per_km, hst_number, billing_email, billing_address, statement_descriptor_suffix, tax_rate_percent, tax_label",
+      "name, slug, platform_fee_percent, base_fare, rate_per_km, hst_number, billing_email, billing_address, statement_descriptor_suffix, tax_rate_percent, tax_label, timezone",
     )
     .eq("id", input.companyId)
     .maybeSingle();
@@ -817,6 +831,7 @@ export async function updateCompany(
     statement_descriptor_suffix: suffix,
     tax_rate_percent: input.taxRatePercent,
     tax_label: taxLabel,
+    timezone: input.timezone,
   };
 
   // Note what this does NOT do: renaming a company does not re-derive its slug or
