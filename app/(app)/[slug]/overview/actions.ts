@@ -5,7 +5,9 @@ import { listCompanies } from "@/app/(app)/[slug]/onboarding/actions";
 import { getHealth } from "@/app/(app)/[slug]/health/actions";
 import { getRevenue } from "@/app/(app)/[slug]/revenue/actions";
 
-// UTC month bounds (match the revenue RPC's bucketing).
+// Month bounds as UTC month STARTS. ops_revenue reads them as month LABELS and
+// buckets each ride by its company's LOCAL month (mgcj 20261024020000), so
+// these must stay first-of-month instants; a mid-month bound is truncated.
 function thisMonthRange() {
   const n = new Date();
   const from = new Date(Date.UTC(n.getUTCFullYear(), n.getUTCMonth(), 1));

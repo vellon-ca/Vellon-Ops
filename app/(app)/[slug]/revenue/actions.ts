@@ -198,7 +198,8 @@ function enumerateMonths(fromISO: string, toISO: string): string[] {
   return out;
 }
 
-// UTC month bounds. month = 'YYYY-MM'.
+// UTC month starts. month = 'YYYY-MM'. ops_revenue reads them as month LABELS
+// and buckets by each company's local month (mgcj 20261024020000).
 function monthBounds(month: string): { start: string; next: string; first: string } {
   const [y, m] = month.split("-").map(Number);
   const start = new Date(Date.UTC(y, m - 1, 1));
