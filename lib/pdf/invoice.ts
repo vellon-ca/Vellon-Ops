@@ -1,5 +1,5 @@
 import "server-only";
-import { PDFDocument, StandardFonts, rgb, type PDFFont, type PDFPage } from "pdf-lib";
+import { LineCapStyle, PDFDocument, StandardFonts, rgb, type PDFFont, type PDFPage } from "pdf-lib";
 
 // Hand-drawn PDF, same style as mgcj-app's send-ride-receipt Edge Function
 // (also pdf-lib) — kept consistent rather than introducing a second PDF
@@ -24,6 +24,7 @@ export type InvoicePdfInput = {
   issueDate: string; // pre-formatted, e.g. "July 18, 2026"
   companyName: string;
   billingAddress: string | null;
+  billingEmail: string | null;
   cashFaresTotal: number;
   feePercent: number;
   rideCount: number;
@@ -62,7 +63,8 @@ export type InvoicePdfInput = {
   totalDue: number;
   vellon: {
     legalName: string | null;
-    businessNumber: string | null;
+    // No business number: 8-4 asks for the GST/HST registration number, which
+    // already carries the BN as its first nine digits.
     hstNumber: string | null;
     mailingAddress: string | null;
     paymentInstructions: string | null;
@@ -116,7 +118,22 @@ export async function buildInvoicePdf(input: InvoicePdfInput): Promise<Uint8Arra
   }
 
   // ── Header ──────────────────────────────────────────────────────────
-  draw(vellonName, left, y, { size: 18, font: bold });
+  // The Vellon mark, drawn from vellon-webpage/src/app/icon.svg (64-unit box)
+  // rather than embedded as an image, so it stays sharp at any zoom.
+  const mark = 26;
+  const k = mark / 64;
+  const markTop = y + 19;
+  page.drawRectangle({ x: left, y: markTop - mark, width: mark, height: mark, color: rgb(0.059, 0.067, 0.078) });
+  page.drawSvgPath("M17 18 L31 43 L45 18", {
+    x: left,
+    y: markTop,
+    scale: k,
+    borderColor: rgb(0.886, 0.902, 0.914),
+    borderWidth: 5,
+    borderLineCap: LineCapStyle.Projecting,
+  });
+  page.drawRectangle({ x: left + 46 * k, y: markTop - 46 * k, width: 6 * k, height: 6 * k, color: rgb(0.769, 0.627, 0.416) });
+  draw(vellonName, left + mark + 10, y, { size: 18, font: bold });
   draw("INVOICE", right, y, { size: 20, font: bold, align: "right" });
 
   y -= 20;
@@ -130,21 +147,22 @@ export async function buildInvoicePdf(input: InvoicePdfInput): Promise<Uint8Arra
   // "HST Reg: 12345" beside a document with no tax line was the original §3
   // defect: it asserts a taxable supply the invoice never charged for. One
   // gate, so the two halves of that claim cannot disagree. (BN is not a tax
-  // claim and prints whenever it is configured.)
-  // "Either section": a month of card rides only still charged tax.
+  // claim.) "Either section": a month of card rides only still charged tax.
   const anyTax = input.tax ?? input.card?.tax ?? input.card?.returned?.tax ?? null;
-  const regNumbers = [
-    input.vellon.businessNumber ? `BN: ${input.vellon.businessNumber}` : null,
+  // "GST/HST No." whatever the tax is called locally: CRA issues one number
+  // for both, the same RT account in a GST-only province.
+  const regNumber =
     anyTax && input.vellon.hstNumber
-      ? `${anyTax.label} Reg: ${input.vellon.hstNumber}`
+      ? `GST/HST No. ${input.vellon.hstNumber}`
       : anyTax && input.preview
-        ? `${anyTax.label} Reg: [not set]`
-        : null,
-  ]
-    .filter(Boolean)
-    .join("   ");
-  if (regNumbers) draw(regNumbers, left, y, { size: 9, color: gray });
+        ? "GST/HST No. [not set]"
+        : null;
   draw(input.issueDate, right, y, { size: 10, color: gray, align: "right" });
+  if (regNumber) {
+    draw(regNumber, left, y, { size: 9, color: gray });
+    y -= 13;
+  }
+  draw(SUPPORT_EMAIL, left, y, { size: 9, color: gray });
 
   y -= 18;
   rule(y);
@@ -159,6 +177,10 @@ export async function buildInvoicePdf(input: InvoicePdfInput): Promise<Uint8Arra
   if (input.billingAddress) {
     y -= 15;
     draw(input.billingAddress, left, y, { size: 10, color: gray });
+  }
+  if (input.billingEmail) {
+    y -= 15;
+    draw(input.billingEmail, left, y, { size: 10, color: gray });
   }
 
   y -= 12;
@@ -190,31 +212,34 @@ export async function buildInvoicePdf(input: InvoicePdfInput): Promise<Uint8Arra
 
   // ── Cash fares: fee payable ───────────────────────────────────────────
   y -= 24;
-  draw("CASH FARES — FEE PAYABLE", left + 6, y, { size: 9, color: gray });
+  // Its tax is NOT here: the cash fee is what is payable, so its subtotal and
+  // tax sit at the bottom with the amount due.
+  draw("CASH FARES", left + 6, y, { size: 9, color: gray });
   y -= 18;
   row(`Cash fares this period (${plural(input.rideCount)})`, money(input.cashFaresTotal), true);
   y -= 18;
   row(`Platform fee (${input.feePercent}%)`, money(input.amountDue));
-  if (input.tax) {
-    y -= 18;
-    row(taxText(input.tax), money(input.tax.amount));
-  }
 
-  // ── Card fares: fee already collected ─────────────────────────────────
+  // ── Card fares: fee and its tax, already paid, so the section nets to 0 ──
   if (input.card && input.card.rideCount > 0) {
     y -= 26;
-    draw("CARD FARES — FEE ALREADY COLLECTED", left + 6, y, { size: 9, color: gray });
+    draw("CARD FARES", left + 6, y, { size: 9, color: gray });
     y -= 18;
     row(`Card fares this period (${plural(input.card.rideCount)})`, money(input.card.faresTotal), true);
     y -= 18;
-    row("Platform fee", money(input.card.fee));
+    // The document carries one rate (fee_percent, the cash side's blend). Print
+    // it here only if the card fee agrees with it to within a cent a ride —
+    // a mid-month rate change would make it the wrong number for this side.
+    const cardAtRate = (input.card.faresTotal * input.feePercent) / 100;
+    const cardRateHolds = Math.abs(cardAtRate - input.card.fee) <= 0.01 * input.card.rideCount;
+    row(cardRateHolds ? `Platform fee (${input.feePercent}%)` : "Platform fee", money(input.card.fee));
     if (input.card.tax) {
       y -= 18;
       row(taxText(input.card.tax), money(input.card.tax.amount));
     }
     y -= 18;
     row(
-      "Collected through Stripe when each fare was charged",
+      "Already paid — taken from your card payments",
       `-${money(input.card.fee + (input.card.tax?.amount ?? 0))}`,
     );
   }
@@ -240,7 +265,14 @@ export async function buildInvoicePdf(input: InvoicePdfInput): Promise<Uint8Arra
   y -= 22;
   rule(y, rgb(0.8, 0.8, 0.8));
 
-  // ── Total ─────────────────────────────────────────────────────────────
+  // ── Total: the cash fee, its tax, what is owed ───────────────────────
+  if (input.tax) {
+    y -= 18;
+    row("Subtotal", money(input.amountDue));
+    y -= 18;
+    row(taxText(input.tax), money(input.tax.amount));
+    y -= 6;
+  }
   y -= 18;
   draw("Amount due", left + 6, y, { size: 13, font: bold });
   draw(money(input.totalDue), right - 6, y, { size: 13, font: bold, align: "right" });
@@ -275,6 +307,8 @@ export async function buildInvoicePdf(input: InvoicePdfInput): Promise<Uint8Arra
 
   return doc.save();
 }
+
+const SUPPORT_EMAIL = "support@vellon.ca";
 
 // 14 rather than 14.00. Deliberately the same one-liner as mgcj's
 // send-ride-receipt: two documents in one system should print a rate

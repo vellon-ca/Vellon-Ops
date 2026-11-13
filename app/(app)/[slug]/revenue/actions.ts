@@ -1081,6 +1081,7 @@ async function renderInvoicePdf(
     issueDate,
     companyName: invoice.company_name,
     billingAddress: company?.billing_address ?? null,
+    billingEmail: company?.billing_email ?? null,
     cashFaresTotal: Number(invoice.cash_fares_total),
     feePercent: Number(invoice.fee_percent),
     rideCount: invoice.ride_count,
