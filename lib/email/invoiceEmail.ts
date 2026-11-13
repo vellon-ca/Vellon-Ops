@@ -8,8 +8,10 @@ export function buildInvoiceEmailHtml(params: {
   companyName: string;
   invoiceNumber: string;
   periodLabel: string;
-  /** The platform fee alone. `totalDue` is the payable figure. */
+  /** The platform fee alone. `totalDue` is the payable figure. Includes `bookingFees`. */
   amountDue: number;
+  /** Passenger booking fees on cash rides, pre-tax. NULL = no line. */
+  bookingFees: { amount: number; rideCount: number } | null;
   /** NULL = no tax line, which is correct while Vellon is unregistered. */
   tax: { label: string; ratePercent: number | null; amount: number } | null;
   totalDue: number;
@@ -24,6 +26,7 @@ export function buildInvoiceEmailHtml(params: {
     invoiceNumber,
     periodLabel,
     amountDue,
+    bookingFees,
     tax,
     totalDue,
     cashFaresTotal,
@@ -63,8 +66,17 @@ export function buildInvoiceEmailHtml(params: {
       </tr>
       <tr>
         <td style="padding: 8px 0; color: #6B7280; font-size: 13px;">Platform fee</td>
-        <td style="padding: 8px 0; font-size: 13px;">${feePercent}% — $${amountDue.toFixed(2)}</td>
+        <td style="padding: 8px 0; font-size: 13px;">${feePercent}% — $${(amountDue - (bookingFees?.amount ?? 0)).toFixed(2)}</td>
       </tr>
+      ${
+        bookingFees
+          ? `
+      <tr>
+        <td style="padding: 8px 0; color: #6B7280; font-size: 13px;">Booking fees</td>
+        <td style="padding: 8px 0; font-size: 13px;">$${bookingFees.amount.toFixed(2)} (${bookingFees.rideCount} ride${bookingFees.rideCount === 1 ? "" : "s"})</td>
+      </tr>`
+          : ""
+      }
       ${
         tax
           ? `
