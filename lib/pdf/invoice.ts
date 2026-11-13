@@ -137,8 +137,9 @@ export async function buildInvoicePdf(input: InvoicePdfInput): Promise<Uint8Arra
   draw("INVOICE", right, y, { size: 20, font: bold, align: "right" });
 
   y -= 20;
-  const fromLine = [input.vellon.mailingAddress, SUPPORT_EMAIL].filter(Boolean).join("   ");
-  draw(fromLine, left, y, { size: 9, color: gray });
+  if (input.vellon.mailingAddress) {
+    draw(input.vellon.mailingAddress, left, y, { size: 9, color: gray });
+  }
   draw(input.invoiceNumber, right, y, { size: 10, color: gray, align: "right" });
 
   y -= 14;
@@ -148,14 +149,20 @@ export async function buildInvoicePdf(input: InvoicePdfInput): Promise<Uint8Arra
   // gate, so the two halves of that claim cannot disagree. (BN is not a tax
   // claim.) "Either section": a month of card rides only still charged tax.
   const anyTax = input.tax ?? input.card?.tax ?? input.card?.returned?.tax ?? null;
+  // "GST/HST No." whatever the tax is called locally: CRA issues one number
+  // for both, the same RT account in a GST-only province.
   const regNumber =
     anyTax && input.vellon.hstNumber
-      ? `${anyTax.label} Reg: ${input.vellon.hstNumber}`
+      ? `GST/HST No. ${input.vellon.hstNumber}`
       : anyTax && input.preview
-        ? `${anyTax.label} Reg: [not set]`
+        ? "GST/HST No. [not set]"
         : null;
-  if (regNumber) draw(regNumber, left, y, { size: 9, color: gray });
   draw(input.issueDate, right, y, { size: 10, color: gray, align: "right" });
+  if (regNumber) {
+    draw(regNumber, left, y, { size: 9, color: gray });
+    y -= 13;
+  }
+  draw(SUPPORT_EMAIL, left, y, { size: 9, color: gray });
 
   y -= 18;
   rule(y);
