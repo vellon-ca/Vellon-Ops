@@ -207,7 +207,12 @@ export async function buildInvoicePdf(input: InvoicePdfInput): Promise<Uint8Arra
     y -= 18;
     row(`Card fares this period (${plural(input.card.rideCount)})`, money(input.card.faresTotal), true);
     y -= 18;
-    row("Platform fee", money(input.card.fee));
+    // The document carries one rate (fee_percent, the cash side's blend). Print
+    // it here only if the card fee agrees with it to within a cent a ride —
+    // a mid-month rate change would make it the wrong number for this side.
+    const cardAtRate = (input.card.faresTotal * input.feePercent) / 100;
+    const cardRateHolds = Math.abs(cardAtRate - input.card.fee) <= 0.01 * input.card.rideCount;
+    row(cardRateHolds ? `Platform fee (${input.feePercent}%)` : "Platform fee", money(input.card.fee));
     if (input.card.tax) {
       y -= 18;
       row(taxText(input.card.tax), money(input.card.tax.amount));
