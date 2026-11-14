@@ -10,6 +10,19 @@ import { LineCapStyle, PDFDocument, StandardFonts, rgb, type PDFFont, type PDFPa
 // omits each blank section entirely rather than printing "undefined" or a
 // placeholder on a document a real company receives.
 
+/**
+ * Rides billed to a business account (0011): payable like cash. The taxi
+ * company bills the business; the driver collected nothing; Vellon's fee and
+ * the whole booking fee are owed here. Both are inside amountDue, and their
+ * tax is inside the one payable `tax` line.
+ */
+export type InvoiceAccountSection = {
+  faresTotal: number;
+  rideCount: number;
+  fee: number;
+  bookingFees: { amount: number; rideCount: number } | null;
+};
+
 /** `ratePercent` NULL prints the line without a percentage. */
 export type InvoiceTaxLine = { label: string; ratePercent: number | null; amount: number };
 
@@ -38,6 +51,8 @@ export type InvoicePdfInput = {
    * of amountDue; its tax is in `tax`. NULL = no line.
    */
   bookingFees: { amount: number; rideCount: number } | null;
+  /** Rides billed to business accounts. Inside amountDue. NULL = none. */
+  account: InvoiceAccountSection | null;
   /**
    * NULL = no tax line on this document, which is correct whenever Vellon is
    * not GST/HST-registered. Snapshotted on the invoice row, never read live
@@ -227,7 +242,10 @@ export async function buildInvoicePdf(input: InvoicePdfInput): Promise<Uint8Arra
   row(`Cash fares this period (${plural(input.rideCount)})`, money(input.cashFaresTotal), true);
   y -= 18;
   const bookingFee = input.bookingFees?.amount ?? 0;
-  row(`Platform fee (${input.feePercent}%)`, money(input.amountDue - bookingFee));
+  const accountPayable = input.account
+    ? input.account.fee + (input.account.bookingFees?.amount ?? 0)
+    : 0;
+  row(`Platform fee (${input.feePercent}%)`, money(input.amountDue - bookingFee - accountPayable));
   if (input.bookingFees) {
     // Collected from passengers by the driver, on top of the fare; Vellon's.
     y -= 18;
@@ -235,6 +253,25 @@ export async function buildInvoicePdf(input: InvoicePdfInput): Promise<Uint8Arra
       `Booking fees collected from passengers (${plural(input.bookingFees.rideCount)})`,
       money(bookingFee),
     );
+  }
+
+  // ── Account rides: billed by you to businesses; fee payable, like cash ──
+  if (input.account && input.account.rideCount > 0) {
+    const a = input.account;
+    y -= 26;
+    draw("ACCOUNT RIDES (BILLED TO BUSINESSES)", left + 6, y, { size: 9, color: gray });
+    y -= 18;
+    row(`Account ride fares this period (${plural(a.rideCount)})`, money(a.faresTotal), true);
+    y -= 18;
+    // Same rule as the card section: print the rate only if it holds here.
+    const atRate = (a.faresTotal * input.feePercent) / 100;
+    const rateHolds = Math.abs(atRate - a.fee) <= 0.01 * a.rideCount;
+    row(rateHolds ? `Platform fee (${input.feePercent}%)` : "Platform fee", money(a.fee));
+    if (a.bookingFees) {
+      // No cash changed hands, so the whole booking fee is Vellon's.
+      y -= 18;
+      row(`Booking fees on account rides (${plural(a.bookingFees.rideCount)})`, money(a.bookingFees.amount));
+    }
   }
 
   // ── Card fares: fee and its tax, already paid, so the section nets to 0 ──
@@ -298,7 +335,9 @@ export async function buildInvoicePdf(input: InvoicePdfInput): Promise<Uint8Arra
   y -= 16;
   draw(
     input.totalDue > 0
-      ? "Terms: cash-fare fees are due on receipt. Card-fare fees were paid at the time of each charge."
+      ? input.account && input.account.rideCount > 0
+        ? "Terms: cash-fare and account-ride fees are due on receipt. Card-fare fees were paid at the time of each charge."
+        : "Terms: cash-fare fees are due on receipt. Card-fare fees were paid at the time of each charge."
       : "Terms: nothing is payable. Card-fare fees were paid at the time of each charge.",
     left + 6,
     y,

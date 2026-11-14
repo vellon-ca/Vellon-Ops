@@ -12,6 +12,13 @@ export function buildInvoiceEmailHtml(params: {
   amountDue: number;
   /** Passenger booking fees on cash rides, pre-tax. NULL = no line. */
   bookingFees: { amount: number; rideCount: number } | null;
+  /** Rides billed to business accounts (0011), inside amountDue. NULL = none. */
+  account: {
+    faresTotal: number;
+    rideCount: number;
+    fee: number;
+    bookingFees: { amount: number; rideCount: number } | null;
+  } | null;
   /** NULL = no tax line, which is correct while Vellon is unregistered. */
   tax: { label: string; ratePercent: number | null; amount: number } | null;
   totalDue: number;
@@ -27,6 +34,7 @@ export function buildInvoiceEmailHtml(params: {
     periodLabel,
     amountDue,
     bookingFees,
+    account,
     tax,
     totalDue,
     cashFaresTotal,
@@ -36,6 +44,8 @@ export function buildInvoiceEmailHtml(params: {
     mailingAddress,
   } = params;
   const year = new Date().getFullYear();
+  const rides = (n: number) => `${n} ride${n === 1 ? "" : "s"}`;
+  const accountTotal = account ? account.fee + (account.bookingFees?.amount ?? 0) : 0;
 
   return `
   <div style="font-family: -apple-system, Helvetica, Arial, sans-serif; max-width: 480px; margin: 0 auto; color: #1a1a1a;">
@@ -46,7 +56,7 @@ export function buildInvoiceEmailHtml(params: {
 
     <p style="font-size: 14px; margin: 0 0 16px;">Hi ${companyName} team,</p>
     <p style="font-size: 14px; margin: 0 0 16px;">
-      Attached is your platform fee invoice for cash rides in ${periodLabel}.
+      Attached is your platform fee invoice for cash${account ? " and account" : ""} rides in ${periodLabel}.
     </p>
 
     <div style="background: #f7f7f7; border-radius: 12px; padding: 20px; margin-bottom: 16px;">
@@ -66,7 +76,7 @@ export function buildInvoiceEmailHtml(params: {
       </tr>
       <tr>
         <td style="padding: 8px 0; color: #6B7280; font-size: 13px;">Platform fee</td>
-        <td style="padding: 8px 0; font-size: 13px;">${feePercent}% — $${(amountDue - (bookingFees?.amount ?? 0)).toFixed(2)}</td>
+        <td style="padding: 8px 0; font-size: 13px;">${feePercent}% — $${(amountDue - (bookingFees?.amount ?? 0) - accountTotal).toFixed(2)}</td>
       </tr>
       ${
         bookingFees
@@ -75,6 +85,27 @@ export function buildInvoiceEmailHtml(params: {
         <td style="padding: 8px 0; color: #6B7280; font-size: 13px;">Booking fees</td>
         <td style="padding: 8px 0; font-size: 13px;">$${bookingFees.amount.toFixed(2)} (${bookingFees.rideCount} ride${bookingFees.rideCount === 1 ? "" : "s"})</td>
       </tr>`
+          : ""
+      }
+      ${
+        account
+          ? `
+      <tr>
+        <td style="padding: 8px 0; color: #6B7280; font-size: 13px;">Account rides total</td>
+        <td style="padding: 8px 0; font-size: 13px;">$${account.faresTotal.toFixed(2)} (${rides(account.rideCount)})</td>
+      </tr>
+      <tr>
+        <td style="padding: 8px 0; color: #6B7280; font-size: 13px;">Platform fee, account rides</td>
+        <td style="padding: 8px 0; font-size: 13px;">$${account.fee.toFixed(2)}</td>
+      </tr>${
+        account.bookingFees
+          ? `
+      <tr>
+        <td style="padding: 8px 0; color: #6B7280; font-size: 13px;">Booking fees, account rides</td>
+        <td style="padding: 8px 0; font-size: 13px;">$${account.bookingFees.amount.toFixed(2)} (${rides(account.bookingFees.rideCount)})</td>
+      </tr>`
+          : ""
+      }`
           : ""
       }
       ${

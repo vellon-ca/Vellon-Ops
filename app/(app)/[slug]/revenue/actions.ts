@@ -15,7 +15,7 @@ import {
 import { supabaseAdmin } from "@/lib/supabase/admin";
 import { writeAudit } from "@/lib/audit";
 import { getPlatformSettings } from "@/app/(app)/[slug]/configuration/actions";
-import { buildInvoicePdf, type InvoiceTaxLine } from "@/lib/pdf/invoice";
+import { buildInvoicePdf, type InvoiceAccountSection, type InvoiceTaxLine } from "@/lib/pdf/invoice";
 import { buildInvoiceEmailHtml } from "@/lib/email/invoiceEmail";
 
 const RESEND_FROM_ADDRESS = "Vellon <billing@vellon.ca>";
@@ -71,9 +71,10 @@ type RevRow = {
   // untaxed, and on a spoke that predates mgcj 20261013000000. Includes the tax
   // on booking_fee_total.
   fee_tax_total: number;
-  // Passenger booking fees on CASH rides, pre-tax: Vellon's, billed on the
-  // invoice (mgcj 20261113040000). NOT in fee_total. 0 on card rows (a card
-  // ride's booking fee is the company's) and on a spoke that predates it.
+  // Passenger booking fees on CASH and ACCOUNT rides, pre-tax: Vellon's,
+  // billed on the invoice (mgcj 20261113040000, 20261114030000). NOT in
+  // fee_total. 0 on card rows (a card ride's booking fee is the company's) and
+  // on a spoke that predates it.
   booking_fee_total: number;
   booking_fee_rides: number;
 };
@@ -85,7 +86,10 @@ export type RevenueSummary = {
     fares: number;
     fee: number; // NET of refunds
     cardFee: number; // NET of refunds (refunds are card-only)
+    // Billed on the monthly document: cash AND account rides (Vellon collected
+    // nothing on either). accountFee is the account part of it.
     cashFee: number;
+    accountFee: number;
     refunds: number; // realized refund loss, netted out of fee/cardFee above
     // Vellon's fee handed back to companies (fee only, no tax), by date of
     // return. Also netted out of fee/cardFee above; its tax out of the tax below.
@@ -232,7 +236,7 @@ export async function getRevenue(
     const rows = await fetchRevRows(spoke, input.fromISO, input.toISO);
 
     const totals = {
-      fares: 0, fee: 0, cardFee: 0, cashFee: 0, refunds: 0, rides: 0,
+      fares: 0, fee: 0, cardFee: 0, cashFee: 0, accountFee: 0, refunds: 0, rides: 0,
       feeTax: 0, cardFeeTax: 0, cashFeeTax: 0, feeReturned: 0,
     };
     const companies = new Map<string, RevenueSummary["byCompany"][number]>();
@@ -254,8 +258,10 @@ export async function getRevenue(
         totals.cardFee += netFee;
         totals.cardFeeTax += r.fee_tax_total;
       } else {
+        // Cash and account rides: both billed on the monthly document.
         totals.cashFee += netFee;
         totals.cashFeeTax += r.fee_tax_total;
+        if (r.payment_method === "account") totals.accountFee += netFee;
       }
 
       const c =
@@ -329,6 +335,7 @@ export async function getRevenue(
           fee: fix(totals.fee),
           cardFee: fix(totals.cardFee),
           cashFee: fix(totals.cashFee),
+          accountFee: fix(totals.accountFee),
           refunds: fix(totals.refunds),
           feeReturned: fix(totals.feeReturned),
           rides: totals.rides,
@@ -613,6 +620,14 @@ export type Invoice = {
   // pre-tax, INCLUDED in amount_due. NULL = none (and every older row).
   cash_booking_fee_total: number | null;
   cash_booking_fee_count: number | null;
+  // 0011_invoice_account_rides.sql. Rides billed to a business account:
+  // payable like cash, fee and booking fees INCLUDED in amount_due, their tax
+  // in tax_amount. NULL = none (and every older row).
+  account_fares_total: number | null;
+  account_ride_count: number | null;
+  account_fee_total: number | null;
+  account_booking_fee_total: number | null;
+  account_booking_fee_count: number | null;
 };
 
 export async function listInvoices(
@@ -734,20 +749,32 @@ async function computeInvoiceRows(
     fares: number; fee: number; tax: number; rides: number;
     bookingFee: number; bookingRides: number;
   };
+  // Account (rides billed to a business account) is payable like cash: Vellon
+  // collected nothing, and the whole booking fee is Vellon's.
   const perCompany = new Map<
     string,
-    { name: string; feePct: number; cash: Side; card: Side }
+    { name: string; feePct: number; cash: Side; card: Side; account: Side }
   >();
+  const emptySide = (): Side => ({ fares: 0, fee: 0, tax: 0, rides: 0, bookingFee: 0, bookingRides: 0 });
   for (const r of rows) {
-    const side = r.payment_method === "cash" ? "cash" : r.payment_method === "card" ? "card" : null;
-    if (!side) continue;
+    const side =
+      r.payment_method === "cash" ? "cash"
+      : r.payment_method === "card" ? "card"
+      : r.payment_method === "account" ? "account"
+      : null;
+    if (!side) {
+      // A method this generator does not know would otherwise vanish from the
+      // invoice silently, which is how account rides went missing (#41).
+      return { ok: false, error: `Unknown payment method "${r.payment_method}" on ${r.company_name}'s rides; the invoice cannot be computed.` };
+    }
     const e =
       perCompany.get(r.company_id) ??
       {
         name: r.company_name,
         feePct: r.fee_percent,
-        cash: { fares: 0, fee: 0, tax: 0, rides: 0, bookingFee: 0, bookingRides: 0 },
-        card: { fares: 0, fee: 0, tax: 0, rides: 0, bookingFee: 0, bookingRides: 0 },
+        cash: emptySide(),
+        card: emptySide(),
+        account: emptySide(),
       };
     e[side].fares += r.fares_total;
     e[side].fee += r.fee_total;
@@ -781,8 +808,9 @@ async function computeInvoiceRows(
       perCompany.set(c.id, {
         name: c.name ?? returnedBy.get(c.id)?.companyName ?? "Unknown company",
         feePct: Number(c.platform_fee_percent ?? 0),
-        cash: { fares: 0, fee: 0, tax: 0, rides: 0, bookingFee: 0, bookingRides: 0 },
-        card: { fares: 0, fee: 0, tax: 0, rides: 0, bookingFee: 0, bookingRides: 0 },
+        cash: emptySide(),
+        card: emptySide(),
+        account: emptySide(),
       });
     }
   }
@@ -801,7 +829,7 @@ async function computeInvoiceRows(
   const settingsRes = await getPlatformSettings();
   if (!settingsRes.ok) return { ok: false, error: settingsRes.error };
   const anyTax =
-    [...perCompany.values()].some((e) => e.cash.tax > 0 || e.card.tax > 0) ||
+    [...perCompany.values()].some((e) => e.cash.tax > 0 || e.card.tax > 0 || e.account.tax > 0) ||
     returns.some((f) => f.tax > 0);
   if (anyTax && !settingsRes.data.hstNumber && !opts.allowMissingHstNumber) {
     return {
@@ -839,12 +867,16 @@ async function computeInvoiceRows(
   const out: ComputedInvoice[] = [...perCompany.entries()]
     .filter(
       ([companyId, e]) =>
-        e.cash.fares > 0 || e.card.fares > 0 || returnedBy.has(companyId),
+        e.cash.fares > 0 || e.card.fares > 0 || e.account.fares > 0 || returnedBy.has(companyId),
     )
     .map(([companyId, e]) => {
       const bookingFee = round2(e.cash.bookingFee);
-      const fee = round2(round2(e.cash.fee) + bookingFee);
-      const cashTax = round2(e.cash.tax);
+      const accountFee = round2(e.account.fee);
+      const accountBookingFee = round2(e.account.bookingFee);
+      // Everything payable on this document, pre-tax: cash and account.
+      const fee = round2(round2(e.cash.fee) + bookingFee + accountFee + accountBookingFee);
+      // One payable tax line, covering cash and account alike.
+      const cashTax = round2(e.cash.tax + e.account.tax);
       const cardTax = round2(e.card.tax);
       const ret = returnedBy.get(companyId);
       const taxed = cashTax > 0 || cardTax > 0 || (ret?.tax ?? 0) > 0;
@@ -866,6 +898,11 @@ async function computeInvoiceRows(
         amount_due: fee,
         cash_booking_fee_total: bookingFee > 0 ? bookingFee : null,
         cash_booking_fee_count: e.cash.bookingRides > 0 ? e.cash.bookingRides : null,
+        account_fares_total: e.account.rides > 0 ? round2(e.account.fares) : null,
+        account_ride_count: e.account.rides > 0 ? e.account.rides : null,
+        account_fee_total: e.account.rides > 0 ? accountFee : null,
+        account_booking_fee_total: accountBookingFee > 0 ? accountBookingFee : null,
+        account_booking_fee_count: e.account.bookingRides > 0 ? e.account.bookingRides : null,
         // The label/rate print beside whichever section carries tax. The
         // company's current rate if it is readable, else a bare "Tax" line:
         // the AMOUNT is what was actually charged either way.
@@ -937,6 +974,8 @@ type BuiltInvoicePdf = {
   amountDue: number;
   /** Booking fees inside amountDue. NULL = none. */
   bookingFees: { amount: number; rideCount: number } | null;
+  /** Rides billed to business accounts, inside amountDue. NULL = none. */
+  account: InvoiceAccountSection | null;
   tax: InvoiceTaxLine | null;
   totalDue: number;
   paymentInstructions: string | null;
@@ -957,7 +996,7 @@ async function buildAndStoreInvoicePdf(
   const { data: invoice, error: invErr } = await supabaseAdmin
     .from("invoices")
     .select(
-      "id, company_id, company_name, period_month, cash_fares_total, fee_percent, ride_count, amount_due, invoice_number, tax_label, tax_rate_percent, tax_amount, total_due, card_fares_total, card_fee_total, card_tax_amount, card_ride_count, card_fee_returned, card_tax_returned, card_fee_return_count, cash_booking_fee_total, cash_booking_fee_count",
+      "id, company_id, company_name, period_month, cash_fares_total, fee_percent, ride_count, amount_due, invoice_number, tax_label, tax_rate_percent, tax_amount, total_due, card_fares_total, card_fee_total, card_tax_amount, card_ride_count, card_fee_returned, card_tax_returned, card_fee_return_count, cash_booking_fee_total, cash_booking_fee_count, account_fares_total, account_ride_count, account_fee_total, account_booking_fee_total, account_booking_fee_count",
     )
     .eq("id", invoiceId)
     .maybeSingle();
@@ -1015,6 +1054,11 @@ type InvoicePdfRow = Pick<
   | "card_fee_return_count"
   | "cash_booking_fee_total"
   | "cash_booking_fee_count"
+  | "account_fares_total"
+  | "account_ride_count"
+  | "account_fee_total"
+  | "account_booking_fee_total"
+  | "account_booking_fee_count"
 > & { id?: string };
 
 // Row -> PDF bytes. Reads the company's billing details and platform settings;
@@ -1106,6 +1150,20 @@ async function renderInvoicePdf(
     bookingFeeTotal > 0
       ? { amount: bookingFeeTotal, rideCount: invoice.cash_booking_fee_count ?? 0 }
       : null;
+  const accountRides = invoice.account_ride_count ?? 0;
+  const accountBookingFee = Number(invoice.account_booking_fee_total ?? 0);
+  const account: InvoiceAccountSection | null =
+    accountRides > 0
+      ? {
+          faresTotal: Number(invoice.account_fares_total ?? 0),
+          rideCount: accountRides,
+          fee: Number(invoice.account_fee_total ?? 0),
+          bookingFees:
+            accountBookingFee > 0
+              ? { amount: accountBookingFee, rideCount: invoice.account_booking_fee_count ?? 0 }
+              : null,
+        }
+      : null;
 
   const pdfBytes = await buildInvoicePdf({
     invoiceNumber,
@@ -1119,6 +1177,7 @@ async function renderInvoicePdf(
     rideCount: invoice.ride_count,
     amountDue: Number(invoice.amount_due),
     bookingFees,
+    account,
     tax,
     card,
     totalDue,
@@ -1138,6 +1197,7 @@ async function renderInvoicePdf(
       rideCount: invoice.ride_count,
       amountDue: Number(invoice.amount_due),
       bookingFees,
+      account,
       tax,
       totalDue,
       paymentInstructions: settingsRes.data.paymentInstructions,
@@ -1234,6 +1294,7 @@ export async function sendInvoice(
     rideCount,
     amountDue,
     bookingFees,
+    account,
     tax,
     totalDue,
     paymentInstructions,
@@ -1268,6 +1329,7 @@ export async function sendInvoice(
         periodLabel,
         amountDue,
         bookingFees,
+        account,
         tax,
         totalDue,
         cashFaresTotal,

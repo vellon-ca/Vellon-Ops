@@ -174,11 +174,17 @@ export function RevenueDashboard({ slug }: { slug: string }) {
                     : "auto-collected"
               }
             />
+            {/* Account rides (business accounts) are billed monthly like cash,
+                so they share the tile; it is renamed only once there are some. */}
             <Tile
-              label="Cash fees"
+              label={rev.totals.accountFee !== 0 ? "Billed fees" : "Cash fees"}
               value={cad(rev.totals.cashFee)}
               dot={CASH}
-              sub="billed monthly"
+              sub={
+                rev.totals.accountFee !== 0
+                  ? `cash ${cad(rev.totals.cashFee - rev.totals.accountFee)} · account rides ${cad(rev.totals.accountFee)} · billed monthly`
+                  : "billed monthly"
+              }
             />
             <Tile label="Completed rides" value={rev.totals.rides.toLocaleString()} />
           </div>
