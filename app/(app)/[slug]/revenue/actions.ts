@@ -68,8 +68,14 @@ type RevRow = {
   fee_total: number;
   refund_total: number; // Vellon's realized loss from refunds (card-only)
   // GST/HST on fee_total, summed per ride on the spoke. 0 while Vellon's fee is
-  // untaxed, and on a spoke that predates mgcj 20261013000000.
+  // untaxed, and on a spoke that predates mgcj 20261013000000. Includes the tax
+  // on booking_fee_total.
   fee_tax_total: number;
+  // Passenger booking fees on CASH rides, pre-tax: Vellon's, billed on the
+  // invoice (mgcj 20261113040000). NOT in fee_total. 0 on card rows (a card
+  // ride's booking fee is the company's) and on a spoke that predates it.
+  booking_fee_total: number;
+  booking_fee_rides: number;
 };
 
 export type RevenueSummary = {
@@ -129,6 +135,8 @@ async function fetchRevRows(
     fee_total: Number(r.fee_total),
     refund_total: Number(r.refund_total ?? 0),
     fee_tax_total: Number(r.fee_tax_total ?? 0),
+    booking_fee_total: Number(r.booking_fee_total ?? 0),
+    booking_fee_rides: Number(r.booking_fee_rides ?? 0),
   }));
 }
 
@@ -234,8 +242,9 @@ export async function getRevenue(
       const isCard = r.payment_method === "card";
       // Net Vellon's realized refund loss out of the fee. Refunds are card-only
       // (refund_total is 0 on cash rows), so this only ever reduces card fees —
-      // cardFee + cashFee still equals totalFee.
-      const netFee = r.fee_total - r.refund_total;
+      // cardFee + cashFee still equals totalFee. Cash booking fees are Vellon's
+      // revenue too (0 on card rows).
+      const netFee = r.fee_total + r.booking_fee_total - r.refund_total;
       totals.fares += r.fares_total;
       totals.fee += netFee;
       totals.refunds += r.refund_total;
@@ -600,6 +609,10 @@ export type Invoice = {
   card_fee_returned: number | null;
   card_tax_returned: number | null;
   card_fee_return_count: number | null;
+  // 0010_invoice_booking_fee.sql. Passenger booking fees on cash rides,
+  // pre-tax, INCLUDED in amount_due. NULL = none (and every older row).
+  cash_booking_fee_total: number | null;
+  cash_booking_fee_count: number | null;
 };
 
 export async function listInvoices(
@@ -716,7 +729,11 @@ async function computeInvoiceRows(
   // groups by month/method, but sum defensively in case of any boundary
   // duplication). Cash is what the invoice bills; card was collected through
   // Stripe at capture and is only stated.
-  type Side = { fares: number; fee: number; tax: number; rides: number };
+  // bookingFee/bookingRides: cash only (0 on card rows), pre-tax; its tax is in `tax`.
+  type Side = {
+    fares: number; fee: number; tax: number; rides: number;
+    bookingFee: number; bookingRides: number;
+  };
   const perCompany = new Map<
     string,
     { name: string; feePct: number; cash: Side; card: Side }
@@ -729,13 +746,15 @@ async function computeInvoiceRows(
       {
         name: r.company_name,
         feePct: r.fee_percent,
-        cash: { fares: 0, fee: 0, tax: 0, rides: 0 },
-        card: { fares: 0, fee: 0, tax: 0, rides: 0 },
+        cash: { fares: 0, fee: 0, tax: 0, rides: 0, bookingFee: 0, bookingRides: 0 },
+        card: { fares: 0, fee: 0, tax: 0, rides: 0, bookingFee: 0, bookingRides: 0 },
       };
     e[side].fares += r.fares_total;
     e[side].fee += r.fee_total;
     e[side].tax += r.fee_tax_total;
     e[side].rides += r.ride_count;
+    e[side].bookingFee += r.booking_fee_total;
+    e[side].bookingRides += r.booking_fee_rides;
     if (side === "cash") e.feePct = r.fee_percent;
     e.name = r.company_name;
     perCompany.set(r.company_id, e);
@@ -762,8 +781,8 @@ async function computeInvoiceRows(
       perCompany.set(c.id, {
         name: c.name ?? returnedBy.get(c.id)?.companyName ?? "Unknown company",
         feePct: Number(c.platform_fee_percent ?? 0),
-        cash: { fares: 0, fee: 0, tax: 0, rides: 0 },
-        card: { fares: 0, fee: 0, tax: 0, rides: 0 },
+        cash: { fares: 0, fee: 0, tax: 0, rides: 0, bookingFee: 0, bookingRides: 0 },
+        card: { fares: 0, fee: 0, tax: 0, rides: 0, bookingFee: 0, bookingRides: 0 },
       });
     }
   }
@@ -823,7 +842,8 @@ async function computeInvoiceRows(
         e.cash.fares > 0 || e.card.fares > 0 || returnedBy.has(companyId),
     )
     .map(([companyId, e]) => {
-      const fee = round2(e.cash.fee);
+      const bookingFee = round2(e.cash.bookingFee);
+      const fee = round2(round2(e.cash.fee) + bookingFee);
       const cashTax = round2(e.cash.tax);
       const cardTax = round2(e.card.tax);
       const ret = returnedBy.get(companyId);
@@ -840,9 +860,12 @@ async function computeInvoiceRows(
         // never re-derived from fares*feePct — a mid-period rate change means
         // feePct is only a blended display value, not something the dollar
         // amount can be recomputed from.
-        // Stays the cash FEE alone — the revenue rollup sums this column as
-        // revenue. The payable figure is total_due.
+        // Stays the cash FEE alone (percentage + booking fees, pre-tax) — the
+        // revenue rollup sums this column as revenue. The payable figure is
+        // total_due.
         amount_due: fee,
+        cash_booking_fee_total: bookingFee > 0 ? bookingFee : null,
+        cash_booking_fee_count: e.cash.bookingRides > 0 ? e.cash.bookingRides : null,
         // The label/rate print beside whichever section carries tax. The
         // company's current rate if it is readable, else a bare "Tax" line:
         // the AMOUNT is what was actually charged either way.
@@ -912,6 +935,8 @@ type BuiltInvoicePdf = {
   rideCount: number;
   /** The fee alone. `totalDue` is what the company owes. */
   amountDue: number;
+  /** Booking fees inside amountDue. NULL = none. */
+  bookingFees: { amount: number; rideCount: number } | null;
   tax: InvoiceTaxLine | null;
   totalDue: number;
   paymentInstructions: string | null;
@@ -932,7 +957,7 @@ async function buildAndStoreInvoicePdf(
   const { data: invoice, error: invErr } = await supabaseAdmin
     .from("invoices")
     .select(
-      "id, company_id, company_name, period_month, cash_fares_total, fee_percent, ride_count, amount_due, invoice_number, tax_label, tax_rate_percent, tax_amount, total_due, card_fares_total, card_fee_total, card_tax_amount, card_ride_count, card_fee_returned, card_tax_returned, card_fee_return_count",
+      "id, company_id, company_name, period_month, cash_fares_total, fee_percent, ride_count, amount_due, invoice_number, tax_label, tax_rate_percent, tax_amount, total_due, card_fares_total, card_fee_total, card_tax_amount, card_ride_count, card_fee_returned, card_tax_returned, card_fee_return_count, cash_booking_fee_total, cash_booking_fee_count",
     )
     .eq("id", invoiceId)
     .maybeSingle();
@@ -988,6 +1013,8 @@ type InvoicePdfRow = Pick<
   | "card_fee_returned"
   | "card_tax_returned"
   | "card_fee_return_count"
+  | "cash_booking_fee_total"
+  | "cash_booking_fee_count"
 > & { id?: string };
 
 // Row -> PDF bytes. Reads the company's billing details and platform settings;
@@ -1074,6 +1101,11 @@ async function renderInvoicePdf(
       : null;
   const totalDue =
     invoice.total_due != null ? Number(invoice.total_due) : Number(invoice.amount_due);
+  const bookingFeeTotal = Number(invoice.cash_booking_fee_total ?? 0);
+  const bookingFees =
+    bookingFeeTotal > 0
+      ? { amount: bookingFeeTotal, rideCount: invoice.cash_booking_fee_count ?? 0 }
+      : null;
 
   const pdfBytes = await buildInvoicePdf({
     invoiceNumber,
@@ -1086,6 +1118,7 @@ async function renderInvoicePdf(
     feePercent: Number(invoice.fee_percent),
     rideCount: invoice.ride_count,
     amountDue: Number(invoice.amount_due),
+    bookingFees,
     tax,
     card,
     totalDue,
@@ -1104,6 +1137,7 @@ async function renderInvoicePdf(
       feePercent: Number(invoice.fee_percent),
       rideCount: invoice.ride_count,
       amountDue: Number(invoice.amount_due),
+      bookingFees,
       tax,
       totalDue,
       paymentInstructions: settingsRes.data.paymentInstructions,
@@ -1199,6 +1233,7 @@ export async function sendInvoice(
     feePercent,
     rideCount,
     amountDue,
+    bookingFees,
     tax,
     totalDue,
     paymentInstructions,
@@ -1232,6 +1267,7 @@ export async function sendInvoice(
         invoiceNumber,
         periodLabel,
         amountDue,
+        bookingFees,
         tax,
         totalDue,
         cashFaresTotal,

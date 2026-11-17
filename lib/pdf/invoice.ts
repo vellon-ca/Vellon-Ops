@@ -28,8 +28,16 @@ export type InvoicePdfInput = {
   cashFaresTotal: number;
   feePercent: number;
   rideCount: number;
-  /** The platform FEE alone, never fee+tax — see 0008_invoice_tax.sql. */
+  /**
+   * The platform FEE alone, never fee+tax — see 0008_invoice_tax.sql. Includes
+   * `bookingFees`.
+   */
   amountDue: number;
+  /**
+   * Passenger booking fees on cash rides, pre-tax, owed to Vellon (0010). Part
+   * of amountDue; its tax is in `tax`. NULL = no line.
+   */
+  bookingFees: { amount: number; rideCount: number } | null;
   /**
    * NULL = no tax line on this document, which is correct whenever Vellon is
    * not GST/HST-registered. Snapshotted on the invoice row, never read live
@@ -218,7 +226,16 @@ export async function buildInvoicePdf(input: InvoicePdfInput): Promise<Uint8Arra
   y -= 18;
   row(`Cash fares this period (${plural(input.rideCount)})`, money(input.cashFaresTotal), true);
   y -= 18;
-  row(`Platform fee (${input.feePercent}%)`, money(input.amountDue));
+  const bookingFee = input.bookingFees?.amount ?? 0;
+  row(`Platform fee (${input.feePercent}%)`, money(input.amountDue - bookingFee));
+  if (input.bookingFees) {
+    // Collected from passengers by the driver, on top of the fare; Vellon's.
+    y -= 18;
+    row(
+      `Booking fees collected from passengers (${plural(input.bookingFees.rideCount)})`,
+      money(bookingFee),
+    );
+  }
 
   // ── Card fares: fee and its tax, already paid, so the section nets to 0 ──
   if (input.card && input.card.rideCount > 0) {
