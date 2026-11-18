@@ -178,6 +178,28 @@ export async function getHealth(
         .or("payment_status.is.null,payment_status.not.in.(succeeded,refunded)")
         .limit(5),
     ),
+    // The same, for a ride billed to a BUSINESS's card (business accounts 2b:
+    // payment_method 'account' + account_billing 'card'). settle-ride captures
+    // it and the expire-pending-rides sweep retries; a miss is otherwise
+    // silent, because nobody collects anything at the car. A detector of its
+    // own: account_billing does not exist on a project without the business
+    // accounts migrations, and that query's error must not zero the check above.
+    runDetector(
+      {
+        key: "account_card_uncaptured",
+        label: "Completed business-card rides not captured",
+        hint: "A ride billed to a business's card was never charged (>10 min); the company is not paid for it.",
+      },
+      mgcj
+        .from("rides")
+        .select("id", { count: "exact" })
+        .eq("status", "completed")
+        .eq("payment_method", "account")
+        .eq("account_billing", "card")
+        .lt("updated_at", mins(10))
+        .or("payment_status.is.null,payment_status.not.in.(succeeded,refunded)")
+        .limit(5),
+    ),
     // Driver flagged online but hasn't broadcast a location in 5 min = a ghost
     // in the dispatch pool (app suspended/crashed without going offline).
     runDetector(
